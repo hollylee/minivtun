@@ -83,10 +83,19 @@ static void print_help(int argc, char *argv[])
 	printf("\n");
 }
 
+/**
+ *  Allocate a new tun/tap device
+ *
+ *  @param dev   The tun device name would be used. It contains real cloned device name on return.
+ *
+ *  @return      Opened cloned tun device fd if all succeeded, otherwise a negative error code.
+ */
 static int tun_alloc(char *dev)
 {
 	int fd = -1, err;
+
 #ifdef __APPLE__
+  #if 0
 	int b_enable = 1, i;
 
 	for (i = 0; i < 8; i++) {
@@ -104,9 +113,49 @@ static int tun_alloc(char *dev)
 		close(fd);
 		return err;
 	}
+  #endif // 0
+
+    struct sockaddr_ctl sc;
+    struct ctl_info ctlInfo;
+	uint32_t i;
+
+	memset(&ctlInfo, 0, sizeof(struct ctl_info));
+	strncpy(ctlInfo.ctl_name, UTUN_CONTROL_NAME, sizeof(ctlInfo.ctl_name));
+
+    fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+	if ( fd < 0 )
+	   return fd;
+
+	err = ioctl(fd, CTLIOCGINFO, &ctlInfo);
+	if ( err < 0 ) {
+	   close(fd);
+	   return err;
+	}
+
+    sc.sc_id = ctlInfo.ctl_id;
+	sc.sc_len = sizeof(struct sockaddr_ctl);
+	sc.sc_family = AF_SYSTEM;
+	sc.ss_sysaddr = AF_SYS_CONTROL;
+
+	i = 0; 
+
+	do {
+	   i++;
+	   sc.sc_unit = i;
+	   err = connect(fd, (struct sockaddr *)&sc, sizeof(struct sockaddr_ctl));
+	} while ( i < UINT32_MAX && err < 0 );
+
+	if ( err < 0 ) {
+	   close(fd);
+	   return err;	
+	}
+
+    snprintf(config.devname, sizeof(config.devname), "utun%u", i - 1);
+
 #else
 	struct ifreq ifr;
 
+    // Open tun/tap clone device
 	if ((fd = open("/dev/net/tun", O_RDWR)) >= 0) {
 	} else if ((fd = open("/dev/tun", O_RDWR)) >= 0) {
 	} else {

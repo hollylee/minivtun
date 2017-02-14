@@ -77,9 +77,10 @@ static int network_receiving(int tunfd, int sockfd)
 		if (out_dlen - MINIVTUN_MSG_IPDATA_OFFSET < ip_dlen)
 			return 0;
 
-		pi.flags = 0;
-		pi.proto = nmsg->ipdata.proto;
-		osx_ether_to_af(&pi.proto);
+		// pi.flags = 0;
+		// pi.proto = nmsg->ipdata.proto;
+		// osx_ether_to_af(&pi.proto);
+		set_pi_with_ether_proto(&pi, ntohs(nmsg->ipdata.proto));
 		iov[0].iov_base = &pi;
 		iov[0].iov_len = sizeof(pi);
 		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
@@ -90,6 +91,7 @@ static int network_receiving(int tunfd, int sockfd)
 
 	return 0;
 }
+
 
 static int tunnel_receiving(int tunfd, int sockfd)
 {
@@ -104,26 +106,28 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	if (rc < sizeof(struct tun_pi))
 		return -1;
 
-	osx_af_to_ether(&pi->proto);
+	// osx_af_to_ether(&pi->proto);
 
 	ip_dlen = (size_t)rc - sizeof(struct tun_pi);
 
 	/* We only accept IPv4 or IPv6 frames. */
-	if (pi->proto == htons(ETH_P_IP)) {
+	uint16_t proto = get_ether_proto_from_pi(pi);
+
+	if ( proto == ETH_P_IP ) {
 		if (ip_dlen < 20)
 			return 0;
-	} else if (pi->proto == htons(ETH_P_IPV6)) {
+	} else if ( proto == ETH_P_IPV6 ) {
 		if (ip_dlen < 40)
 			return 0;
 	} else {
-		fprintf(stderr, "*** Invalid protocol: 0x%x.\n", ntohs(pi->proto));
+		fprintf(stderr, "*** Invalid protocol: 0x%x.\n", proto);
 		return 0;
 	}
 
 	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
 	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
 	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
-	nmsg.ipdata.proto = pi->proto;
+	nmsg.ipdata.proto = htons(get_ether_proto_from_pi(pi)); // pi->proto;
 	nmsg.ipdata.ip_dlen = htons(ip_dlen);
 	memcpy(nmsg.ipdata.data, pi + 1, ip_dlen);
 

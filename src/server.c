@@ -441,7 +441,7 @@ static inline void dest_addr_of_ipdata(
 	}
 }
 
-
+// This would get called when we have data to receive from a normal interface, i.e. from sockfd
 static int network_receiving(int tunfd, int sockfd)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
@@ -458,6 +458,7 @@ static int network_receiving(int tunfd, int sockfd)
 	struct iovec iov[2];
 	int rc;
 
+    // 1. Read a 'struct sockaddr_inx' from sockfd 
 	real_peer_alen = sizeof(real_peer);
 	rc = recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
 			(struct sockaddr *)&real_peer, &real_peer_alen);
@@ -478,6 +479,8 @@ static int network_receiving(int tunfd, int sockfd)
 		return 0;
 
 	switch (nmsg->hdr.opcode) {
+
+		// Keepalive packet
 	case MINIVTUN_MSG_KEEPALIVE:
 		if ((re = ra_get_or_create(&real_peer))) {
 			re->last_recv = current_ts;
@@ -498,6 +501,8 @@ static int network_receiving(int tunfd, int sockfd)
 				ce->last_recv = current_ts;
 		}
 		break;
+
+		// data packet
 	case MINIVTUN_MSG_IPDATA:
 		if (nmsg->ipdata.proto == htons(ETH_P_IP)) {
 			af = AF_INET;
@@ -525,9 +530,10 @@ static int network_receiving(int tunfd, int sockfd)
 		ce->last_recv = current_ts;
 		ce->ra->last_recv = current_ts;
 
-		pi.flags = 0;
-		pi.proto = nmsg->ipdata.proto;
-		osx_ether_to_af(&pi.proto);
+		//pi.flags = 0;
+		// pi.proto = nmsg->ipdata.proto;
+		//osx_ether_to_af(&pi.proto);
+		set_pi_with_ether_proto(&pi, ntohs(nmsg->ipdata.proto));
 		iov[0].iov_base = &pi;
 		iov[0].iov_len = sizeof(pi);
 		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
@@ -539,6 +545,7 @@ static int network_receiving(int tunfd, int sockfd)
 	return 0;
 }
 
+// When sth. readable from tun interface.
 static int tunnel_receiving(int tunfd, int sockfd)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
@@ -552,14 +559,25 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	int rc;
 
 	rc = read(tunfd, pi, NM_PI_BUFFER_SIZE);
+#if DEBUG	
+	if ( rc < 0 ) {
+	   perror("read");
+	   abort();
+	}
+
+    printf("tunnel_receiving:\n");
+	hexdump(read_buffer, rc);
+#endif
+
 	if (rc < sizeof(struct tun_pi))
 		return 0;
 
-	osx_af_to_ether(&pi->proto);
+	// osx_af_to_ether(&pi->proto);
 
 	ip_dlen = (size_t)rc - sizeof(struct tun_pi);
 
 	/* We only accept IPv4 or IPv6 frames. */
+	/*
 	if (pi->proto == htons(ETH_P_IP)) {
 		af = AF_INET;
 		if (ip_dlen < 20)
@@ -570,6 +588,21 @@ static int tunnel_receiving(int tunfd, int sockfd)
 			return 0;
 	} else {
 		fprintf(stderr, "*** Invalid protocol: 0x%x.\n", ntohs(pi->proto));
+		return 0;
+	}
+	*/
+	af = get_family_from_pi(pi);
+
+	if ( af == AF_INET ) {
+	   if ( ip_dlen < 20 )
+	      return 0;
+	}
+	else if ( af == AF_INET6 ) {
+	   if ( ip_dlen < 40 )
+	      return 0;
+	}
+	else {   
+		fprintf(stderr, "*** Invalid protocol: 0x%x.\n", get_ether_proto_from_pi(pi));
 		return 0;
 	}
 
@@ -607,7 +640,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
 	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
 	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
-	nmsg.ipdata.proto = pi->proto;
+	nmsg.ipdata.proto = htons(get_ether_proto_from_pi(pi)); // pi->proto;
 	nmsg.ipdata.ip_dlen = htons(ip_dlen);
 	memcpy(nmsg.ipdata.data, pi + 1, ip_dlen);
 
@@ -615,6 +648,13 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	out_data = crypt_buffer;
 	out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
 	local_to_netmsg(&nmsg, &out_data, &out_dlen);
+
+#if DEBUG
+    dump_nmsg(&nmsg);
+
+	printf("out data:\n");
+	hexdump(out_data, out_dlen);
+#endif	
 
 	rc = sendto(sockfd, out_data, out_dlen, 0,
 				(struct sockaddr *)&ce->ra->real_addr,
