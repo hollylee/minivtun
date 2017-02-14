@@ -465,6 +465,11 @@ static int network_receiving(int tunfd, int sockfd)
 	if (rc <= 0)
 		return 0;
 
+#if DEBUG
+    printf("network_receiving: received %d bytes\n", rc);
+	hexdump(read_buffer, rc);
+#endif
+
 	out_data = crypt_buffer;
 	out_dlen = (size_t)rc;
 	netmsg_to_local(read_buffer, &out_data, &out_dlen);
@@ -473,6 +478,10 @@ static int network_receiving(int tunfd, int sockfd)
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
 		return 0;
  
+ #if DEBUG
+    dump_nmsg(nmsg);
+ #endif
+
 	/* Verify password. */
 	if (memcmp(nmsg->hdr.auth_key, config.crypto_key,
 		sizeof(nmsg->hdr.auth_key)) != 0)
@@ -539,6 +548,13 @@ static int network_receiving(int tunfd, int sockfd)
 		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
 		iov[1].iov_len = ip_dlen;
 		rc = writev(tunfd, iov, 2);
+
+#ifdef DEBUG
+        printf("Write to tun: ");
+		hexdump(iov[0].iov_base, iov[0].iov_len);
+		hexdump(iov[1].iov_base, iov[1].iov_len);
+#endif
+
 		break;
 	}
 
