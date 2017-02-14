@@ -44,8 +44,8 @@ struct minivtun_msg {
 
 	union {
 		struct {
-			__be16 proto;   /* ETH_P_IP or ETH_P_IPV6 */
-			__be16 ip_dlen; /* Total length of IP/IPv6 data */
+			__be16 proto;   /* ETH_P_IP or ETH_P_IPV6 */ /* in network byte order! */
+			__be16 ip_dlen; /* Total length of IP/IPv6 data */ 
 			char data[NM_PI_BUFFER_SIZE];
 		} __attribute__((packed)) ipdata;
 		struct {
@@ -80,6 +80,46 @@ static inline void netmsg_to_local(void *in, void **out, size_t *dlen)
 int run_client(int tunfd, const char *peer_addr_pair);
 int run_server(int tunfd, const char *loc_addr_pair);
 int vt_route_add(struct in_addr *network, unsigned prefix, struct in_addr *gateway);
+
+#if DEBUG
+static inline void dump_nmsg(struct minivtun_msg * nmsg)
+{
+	int i;
+
+	printf("nmsg.hdr: opcode = 0x%x(%s), rsv = 0x%x, 0x%x, 0x%x, auth_key = ", 
+	       nmsg->hdr.opcode, 
+		   nmsg->hdr.opcode == MINIVTUN_MSG_IPDATA ? "IPDATA" : (nmsg->hdr.opcode == MINIVTUN_MSG_KEEPALIVE ? "Keepalive" : "Unknown"), 
+		   nmsg->hdr.rsv[0], nmsg->hdr.rsv[1], nmsg->hdr.rsv[2]);
+
+	for ( i = 0; i < 16; i++ )
+	    printf("0x%02x, ", nmsg->hdr.auth_key[i]);
+	printf("\n");
+
+    if ( nmsg->hdr.opcode == MINIVTUN_MSG_KEEPALIVE ) {
+
+	   char in_addr_string[256];
+	   char in6_addr_string[256];
+
+	   inet_ntop(AF_INET, &(nmsg->keepalive.loc_tun_in), in_addr_string, 256);
+	   inet_ntop(AF_INET6, &(nmsg->keepalive.loc_tun_in6), in6_addr_string, 256);
+	   
+	   printf("nmsg.keepalive: in %s, in6: %s\n", in_addr_string, in6_addr_string);
+
+	}
+
+	if ( nmsg->hdr.opcode == MINIVTUN_MSG_IPDATA ) {
+
+	   printf("nmsg.ipdata: proto = 0x%x(0x%x), ip_dlen = %d(%d), data = ", 
+	          nmsg->ipdata.proto, ntohs(nmsg->ipdata.proto), nmsg->ipdata.ip_dlen, ntohs(nmsg->ipdata.ip_dlen));
+
+	   for ( i = 0; i < ntohs(nmsg->ipdata.ip_dlen); i++ )
+	       printf("0x%02x, ", nmsg->ipdata.data[i]);
+	   printf("\n");
+
+	}
+}
+
+#endif // DEBUG
 
 #endif /* __MINIVTUN_H */
 

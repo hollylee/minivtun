@@ -101,6 +101,7 @@ static inline bool is_valid_unicast_in6(struct in6_addr *in6)
 /* =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= */
 
 #ifdef __APPLE__
+  #if 0
 	#include <net/if.h>
 
 	/* Protocol info prepended to the packets */
@@ -134,12 +135,74 @@ static inline bool is_valid_unicast_in6(struct in6_addr *in6)
 			break;
 		}
 	}
-#else
+  #endif // 0
+
+    #include <sys/sys_domain.h>    // SYSPROTO_CONTROL, AF_SYS_CONTROL
+    #include <sys/kern_control.h>  // sockaddr_ctl, ctl_info
+    #include <net/if_utun.h>       // UTUN_CONTROL_NAME
+
+    // Apple's utun has a 4 bytes head. IP == 0x02 (AF_INET), IPv6 == 0x1E (AF_INET6)
+    struct tun_pi {
+           uint32_t proto;
+	} __attribute__((packed));
+
+    static inline sa_family_t get_family_from_pi(struct tun_pi * pi)
+	{
+	    return ntohl(pi->proto);
+	}
+
+    static inline uint16_t get_ether_proto_from_pi(struct tun_pi * pi)
+	{
+		uint32_t hl = ntohl(pi->proto);
+	    if ( hl == AF_INET )
+		   return ETH_P_IP;
+		else if ( hl == AF_INET6 )
+		   return ETH_P_IPV6;
+		else
+		   return hl;
+	}
+
+    static inline void set_pi_with_ether_proto(struct tun_pi * pi, uint16_t ether_proto)
+	{
+         uint16_t ns = htons(ether_proto);
+
+		 if ( ns == ETH_P_IP )
+		    pi->proto = htonl(AF_INET);
+		 else if ( ns == ETH_P_IPV6 )
+		    pi->proto = htonl(AF_INET6);
+	}
+
+#elif defined (__linux__)
+
 	#include <linux/if.h>
 	#include <linux/if_tun.h>
 
-	#define osx_af_to_ether(x)
-	#define osx_ether_to_af(x)
+    static inline uint16_t get_ether_proto_from_pi(struct tun_pi * pi)
+	{
+		   return ntohs(pi->proto);
+	}
+
+    static inline sa_family_t get_family_from_pi(struct tun_pi * pi)
+	{
+	    uint16_t ether_proto = get_ether_proto_from_pi(pi);
+		if ( ether_proto == ETH_P_IP )
+		   return AF_INET;
+		else if ( ether_proto == ETH_P_IPV6 )
+		   return AF_INET6;
+		else
+		   return AF_UNSPEC;
+	}
+
+    static inline voie set_pi_with_ether_proto(struct tun_pi * pi, uint16_t ether_proto)
+	{
+		 pi->flags = 0;
+         pi->proto = htons(ether_proto);
+	}
+	
+#else
+
+    #error Only Linux and OSX got supported so far.
+
 #endif
 
 /* =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= */

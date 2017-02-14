@@ -9,8 +9,9 @@ PREFIX := $(shell [ -d /opt/local ] && echo /opt/local || echo /usr )
 endif
 
 CC ?= gcc
-CFLAGS += -Wall
+CFLAGS += -Wall -I/opt/local/include 
 HEADERS = minivtun.h library.h list.h jhash.h
+LDFLAGS += -L/opt/local/lib -lcrypto
 
 minivtun: minivtun.o library.o server.o client.o
 	$(CC) $(LDFLAGS) -o $@ $^ -lcrypto
