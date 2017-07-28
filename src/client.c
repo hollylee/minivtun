@@ -22,6 +22,7 @@
 
 static time_t last_recv = 0, last_keepalive = 0, current_ts = 0;
 
+// Handling packets received from Internet.
 static int network_receiving(int tunfd, int sockfd)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
@@ -91,7 +92,8 @@ static int network_receiving(int tunfd, int sockfd)
 	return 0;
 }
 
-
+// Handling packets received from tunnel. That is, local applications send them to
+// outside.
 static int tunnel_receiving(int tunfd, int sockfd)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
@@ -105,8 +107,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	if (rc < sizeof(struct tun_pi))
 		return 0;
 
-	// osx_af_to_ether(&pi->proto);
-
+    //
 	ip_dlen = (size_t)rc - sizeof(struct tun_pi);
 
 	/* We only accept IPv4 or IPv6 frames. */
@@ -123,6 +124,15 @@ static int tunnel_receiving(int tunfd, int sockfd)
 		return 0;
 	}
 
+    // TODO: Check china ip list, and do routing according to the result.
+	// If the destination is demestic, just forward the packet.
+	// If the desitnation is foreign, convert to netmsg
+	/*
+	if ( gfw_needs_to_be_crossed_over() ) {
+	   
+	}
+	*/
+    
 	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
 	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
 	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
@@ -146,6 +156,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	return 0;
 }
 
+// Send leep-alive packet out
 static int peer_keepalive(int sockfd)
 {
 	char in_data[64], crypt_buffer[64];
@@ -174,8 +185,8 @@ static int peer_keepalive(int sockfd)
 	return rc;
 }
 
-static int try_resolve_and_connect(const char *peer_addr_pair,
-		struct sockaddr_inx *peer_addr)
+// This function would be called each time that we need to re-establish virtual connecion
+static int try_resolve_and_connect(const char *peer_addr_pair, struct sockaddr_inx *peer_addr)
 {
 	int sockfd, rc;
 
@@ -186,6 +197,34 @@ static int try_resolve_and_connect(const char *peer_addr_pair,
 		fprintf(stderr, "*** socket() failed: %s.\n", strerror(errno));
 		return -1;
 	}
+
+    // Here, we should detect possible default interface/ip address changes and bind to 
+	// new address.
+	struct sockaddr_in bind_addr_in;
+	if ( config.bind_if[0] != 0 && get_ip_addr_of_interface(config.bind_if, &bind_addr_in) == 0 ) {
+	   char * bind_addr_string = inet_ntoa(bind_addr_in.sin_addr);
+	   if ( bind_addr_string != 0 )
+	      strncpy(config.bind_to_addr, bind_addr_string, sizeof(config.bind_to_addr) - 1);
+	   else
+	      config.bind_to_addr[0] = 0;
+	}
+	
+	//
+	if ( config.bind_to_addr[0] != 0 ) {
+	   struct sockaddr_in bind_in;
+	   bind_in.sin_len = sizeof(struct sockaddr_in);
+	   bind_in.sin_family = AF_INET;
+	   bind_in.sin_port = 0;
+	   inet_aton(config.bind_to_addr, &bind_in.sin_addr);
+	   memset(bind_in.sin_zero, 0, 8);
+
+	   if ( bind(sockfd, (struct sockaddr *)&bind_in, sizeof(struct sockaddr_in)) < 0 ) {
+		  close(sockfd);
+		  return -EADDRNOTAVAIL;
+	   }
+	}
+	// 
+
 	if (connect(sockfd, (struct sockaddr *)peer_addr, sizeof_sockaddr(peer_addr)) < 0) {
 		close(sockfd);
 		return -EAGAIN;
@@ -195,6 +234,9 @@ static int try_resolve_and_connect(const char *peer_addr_pair,
 	return sockfd;
 }
 
+// The entry. Called from main() in minivtun.c directly after ifconfig interfaces
+//
+// @param peer_addr_pair:  <remote-host>:<port>
 int run_client(int tunfd, const char *peer_addr_pair)
 {
 	struct timeval timeo;
@@ -208,8 +250,8 @@ int run_client(int tunfd, const char *peer_addr_pair)
 		last_recv = time(NULL);
 		inet_ntop(peer_addr.sa.sa_family, addr_of_sockaddr(&peer_addr),
 				  s_peer_addr, sizeof(s_peer_addr));
-		printf("Mini virtual tunnelling client to %s:%u, interface: %s.\n",
-				s_peer_addr, ntohs(port_of_sockaddr(&peer_addr)), config.devname);
+		printf("Mini virtual tunnelling client to %s:%u, interface: %s, bind to address %s\n",
+				s_peer_addr, ntohs(port_of_sockaddr(&peer_addr)), config.devname, config.bind_to_addr);
 	} else if (sockfd == -EAGAIN && config.wait_dns) {
 		/* Resolve later (last_recv = 0). */
 		last_recv = 0;
@@ -218,6 +260,10 @@ int run_client(int tunfd, const char *peer_addr_pair)
 			   "to be tried later.\n", peer_addr_pair);
 	} else if (sockfd == -EINVAL) {
 		fprintf(stderr, "*** Invalid address pair '%s'.\n", peer_addr_pair);
+		return -1;
+	}
+	else if ( sockfd == -EADDRNOTAVAIL ) {
+		fprintf(stderr, "*** Cannot bind to address '%s'.\n", config.bind_to_addr);
 		return -1;
 	} else {
 		fprintf(stderr, "*** Unable to connect to '%s'.\n", peer_addr_pair);

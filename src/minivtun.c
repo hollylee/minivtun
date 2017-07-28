@@ -20,6 +20,7 @@
 
 #include "minivtun.h"
 
+
 struct minivtun_config config = {
 	.keepalive_timeo = 13,
 	.reconnect_timeo = 60,
@@ -30,6 +31,9 @@ struct minivtun_config config = {
 	.pid_file = NULL,
 	.in_background = false,
 	.wait_dns = false,
+	.send_all_traffic = false,
+	.bind_to_addr = "",
+	.bind_if = ""
 };
 
 static struct option long_opts[] = {
@@ -48,6 +52,8 @@ static struct option long_opts[] = {
 	{ "daemon", no_argument, 0, 'd', },
 	{ "wait-dns", no_argument, 0, 'w', },
 	{ "help", no_argument, 0, 'h', },
+	{ "send-all-traffic", no_argument, 0, 'f' },
+	{ "bind-to-addr", required_argument, 0, 'b' },
 	{ 0, 0, 0, 0, },
 };
 
@@ -75,6 +81,8 @@ static void print_help(int argc, char *argv[])
 	printf("                                      route a network to a client address, can be multiple\n");
 	printf("  -w, --wait-dns                      wait for DNS resolve ready after service started.\n");
 	printf("  -d, --daemon                        run as daemon process\n");
+	printf("  -f, --send-all-traffic              send all traffic through the tunnel\n");
+	printf("  -b, --bind-to-addr <addr>           bind to specified address. If omitted, would be bound to the address with the first default route.");
 	printf("  -h, --help                          print this help\n");
 	printf("Supported encryption types:\n");
 	printf("  ");
@@ -143,7 +151,7 @@ static int tun_alloc(char *dev)
 	   i++;
 	   sc.sc_unit = i;
 	   err = connect(fd, (struct sockaddr *)&sc, sizeof(struct sockaddr_ctl));
-	} while ( i < UINT32_MAX && err < 0 );
+	} while ( i < 256 && err < 0 );
 
 	if ( err < 0 ) {
 	   close(fd);
@@ -230,7 +238,7 @@ int main(int argc, char *argv[])
 	char cmd[128];
 	int tunfd, opt;
 
-	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:dwh",
+	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:b:dwhf",
 			long_opts, NULL)) != -1) {
 
 		switch (opt) {
@@ -281,13 +289,21 @@ int main(int argc, char *argv[])
 			print_help(argc, argv);
 			exit(0);
 			break;
+		case 'f':
+		    config.send_all_traffic = 1;
+			break;
+		case 'b':
+			strncpy(config.bind_to_addr, optarg, sizeof(config.bind_to_addr) - 1);
+			break;
 		case '?':
 			exit(1);
 		}
 	}
 
+    // This is for Linux only. In OS X, config.devname would be overwritten to "utun%d" in tun_alloc()
 	if (strlen(config.devname) == 0)
 		strcpy(config.devname, "mv%d");
+
 	if ((tunfd = tun_alloc(config.devname)) < 0) {
 		fprintf(stderr, "*** open_tun() failed: %s.\n", strerror(errno));
 		exit(1);
@@ -295,10 +311,21 @@ int main(int argc, char *argv[])
 
 	/* Configure IPv4 address for the interface. */
 	if (tun_ip_config) {
+
 		char s_lip[20], s_rip[20], *sp;
 		struct in_addr vaddr;
 		int pfxlen = 0;
 
+        // client needs to determine binding ip address
+		if ( peer_addr_pair ) {
+		   if ( validate_and_setup_bind_addr(config.bind_to_addr, sizeof(config.bind_to_addr),
+		                                     config.bind_if, sizeof(config.bind_if)) < 0 ) {
+			  fprintf(stderr, "Invalid bind_to_addr address: %s, multiple default routes, or cannot get bound address from default route.\n", config.bind_to_addr);
+			  exit(1);
+		   }
+		}
+
+        // Get local ip address
 		if (!(sp = strchr(tun_ip_config, '/'))) {
 			fprintf(stderr, "*** Invalid IPv4 address pair: %s.\n", tun_ip_config);
 			exit(1);
@@ -314,6 +341,8 @@ int main(int argc, char *argv[])
 			exit(1);
 		}
 		config.local_tun_in = vaddr;
+
+		// If it is local_ip/remote_ip format of -r option
 		if (inet_pton(AF_INET, s_rip, &vaddr)) {
 			struct in_addr __network = { .s_addr = 0 };
 #ifdef __APPLE__
@@ -322,7 +351,9 @@ int main(int argc, char *argv[])
 			sprintf(cmd, "ifconfig %s %s pointopoint %s", config.devname, s_lip, s_rip);
 #endif
 			vt_route_add(&__network, 0, &vaddr);
-		} else if (sscanf(s_rip, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen < 31 ) {
+		} 
+		// If it is local_ip/prefix format of -r option
+		else if (sscanf(s_rip, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen < 31 ) {
 			uint32_t mask = ~((1 << (32 - pfxlen)) - 1);
 #ifdef __APPLE__
 			uint32_t network = ntohl(vaddr.s_addr) & mask;
@@ -335,12 +366,24 @@ int main(int argc, char *argv[])
 					(mask >> 8) & 0xff, mask & 0xff);
 			sprintf(cmd, "ifconfig %s %s netmask %s", config.devname, s_lip, s_rip);
 #endif
-		} else {
+		} 
+		else {
 			fprintf(stderr, "*** Not a legal netmask or prefix length: %s.\n",
 					s_rip);
 			exit(1);
 		}
+
+		// Run ifconfig
 		(void)system(cmd);
+
+		// Invoking route command to add default if config.send_all_traffic
+		if ( config.send_all_traffic ) {
+#ifdef __APPLE__
+           // 1. Add a ifscoped default route for current default
+#else
+  #error Not implemented
+#endif			
+		}
 	}
 
 	/* Configure IPv6 address if set. */

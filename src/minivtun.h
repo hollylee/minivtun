@@ -9,6 +9,8 @@
 
 #include "library.h"
 
+#include <net/if.h>
+
 extern struct minivtun_config config;
 
 struct minivtun_config {
@@ -25,6 +27,10 @@ struct minivtun_config {
 	const void *crypto_type;
 	struct in_addr local_tun_in;
 	struct in6_addr local_tun_in6;
+
+	int send_all_traffic;
+	char bind_to_addr[64];
+	char bind_if[IFNAMSIZ];
 };
 
 enum {
