@@ -164,11 +164,9 @@ static inline bool is_valid_unicast_in6(struct in6_addr *in6)
 
     static inline void set_pi_with_ether_proto(struct tun_pi * pi, uint16_t ether_proto)
 	{
-         uint16_t ns = htons(ether_proto);
-
-		 if ( ns == ETH_P_IP )
+		 if ( ether_proto == ETH_P_IP )
 		    pi->proto = htonl(AF_INET);
-		 else if ( ns == ETH_P_IPV6 )
+		 else if ( ether_proto == ETH_P_IPV6 )
 		    pi->proto = htonl(AF_INET6);
 	}
 

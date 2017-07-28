@@ -75,3 +75,8 @@ Multiple clients on different devices can be connected to the same server:
 ### Diagnoses
 
 None.
+
+### Updates from Holly Lee <holly.lee@gmail.com>
+
+* Added native OSX utun support.
+* China\_ip\_list address: `https://github.com/17mon/china_ip_list/raw/master/china_ip_list.txt`
