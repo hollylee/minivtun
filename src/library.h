@@ -191,7 +191,7 @@ static inline bool is_valid_unicast_in6(struct in6_addr *in6)
 		   return AF_UNSPEC;
 	}
 
-    static inline voie set_pi_with_ether_proto(struct tun_pi * pi, uint16_t ether_proto)
+    static inline void set_pi_with_ether_proto(struct tun_pi * pi, uint16_t ether_proto)
 	{
 		 pi->flags = 0;
          pi->proto = htons(ether_proto);
