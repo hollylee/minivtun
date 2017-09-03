@@ -19,7 +19,7 @@
 #include <netinet/in.h>
 
 #include "minivtun.h"
-
+#include "client_route.h"
 
 struct minivtun_config config = {
 	.keepalive_timeo = 13,
@@ -35,6 +35,14 @@ struct minivtun_config config = {
 	.bind_to_addr = "",
 	.bind_if = ""
 };
+
+#if !defined( __APPLE_NETWORK_EXTENSION__ ) && !defined( __ANDROID_VPN_SERVICE__ )
+
+#ifdef __APPLE__
+    #include <sys/sys_domain.h>    // SYSPROTO_CONTROL, AF_SYS_CONTROL
+    #include <sys/kern_control.h>  // sockaddr_ctl, ctl_info
+    #include <net/if_utun.h>       // UTUN_CONTROL_NAME
+#endif
 
 static struct option long_opts[] = {
 	{ "local", required_argument, 0, 'l', },
@@ -447,3 +455,17 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
+#endif // !__APPLE_NETWORK_EXTENSION__ && !__ANDROID_VPN_SERVICE__
+
+
+#if defined(__APPLE_NETWORK_EXTENSION__) || defined(__ANDROID_VPN_SERVICE__)
+
+void set_config_params(const char * crypto_key)
+{
+	 // strncpy(config.crypto_passwd, crypto_key, CRYPTO_MAX_KEY_SIZE);
+     config.crypto_passwd = strdup(crypto_key);
+	 fill_with_string_md5sum(config.crypto_passwd, config.crypto_key, CRYPTO_MAX_KEY_SIZE);
+     config.crypto_type = get_crypto_type(CRYPTO_DEFAULT_ALGORITHM);	 
+}
+
+#endif // __APPLE_NETWORK_EXTENSION__

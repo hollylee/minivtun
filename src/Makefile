@@ -13,6 +13,10 @@ CFLAGS += -Wall -I/opt/local/include
 HEADERS = minivtun.h library.h list.h jhash.h
 LDFLAGS += -L/opt/local/lib -lcrypto
 
+ifneq ($(DEBUG),)
+CFLAGS += -DDEBUG=1 -g
+endif
+
 minivtun: minivtun.o library.o server.o client.o client_route.o
 	$(CC) $(LDFLAGS) -o $@ $^ -lcrypto
 
