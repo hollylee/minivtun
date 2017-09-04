@@ -350,7 +350,7 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	local_to_netmsg(nmsg, &out_msg, &out_len);
 
-	rc = sendto(sockfd, out_msg, out_len, 0, (struct sockaddr *)&re->real_addr,
+	rc = (int)sendto(sockfd, out_msg, out_len, 0, (struct sockaddr *)&re->real_addr,
 				sizeof_sockaddr(&re->real_addr));
 
 	/* Update 'last_xmit' only when it's really sent out. */
@@ -460,7 +460,7 @@ static int network_receiving(int tunfd, int sockfd)
 
     // 1. Read a 'struct sockaddr_inx' from sockfd 
 	real_peer_alen = sizeof(real_peer);
-	rc = recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
+	rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
 			(struct sockaddr *)&real_peer, &real_peer_alen);
 	if (rc <= 0)
 		return 0;
@@ -547,7 +547,7 @@ static int network_receiving(int tunfd, int sockfd)
 		iov[0].iov_len = sizeof(pi);
 		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
 		iov[1].iov_len = ip_dlen;
-		rc = writev(tunfd, iov, 2);
+		rc = (int)writev(tunfd, iov, 2);
 
 #ifdef DEBUG
         printf("Write to tun: ");
@@ -574,7 +574,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	struct tun_client *ce;
 	int rc;
 
-	rc = read(tunfd, pi, NM_PI_BUFFER_SIZE);
+	rc = (int)read(tunfd, pi, NM_PI_BUFFER_SIZE);
 #if DEBUG	
 	if ( rc < 0 ) {
 	   perror("read");
@@ -672,7 +672,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	hexdump(out_data, out_dlen);
 #endif	
 
-	rc = sendto(sockfd, out_data, out_dlen, 0,
+	rc = (int)sendto(sockfd, out_data, out_dlen, 0,
 				(struct sockaddr *)&ce->ra->real_addr,
 				sizeof_sockaddr(&ce->ra->real_addr));
 	ce->last_xmit = current_ts;

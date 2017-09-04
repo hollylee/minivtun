@@ -83,7 +83,7 @@ void datagram_encrypt(const void *key, const void *cptype, void *in,
 	EVP_CIPHER_CTX_init(&ctx);
 	assert(EVP_EncryptInit_ex(&ctx, cptype, NULL, key, iv));
 	EVP_CIPHER_CTX_set_padding(&ctx, 0);
-	assert(EVP_EncryptUpdate(&ctx, out, &outl, in, *dlen));
+	assert(EVP_EncryptUpdate(&ctx, out, &outl, in, (int)*dlen));
 	assert(EVP_EncryptFinal_ex(&ctx, (unsigned char *)out + outl, &outl2));
 	EVP_CIPHER_CTX_cleanup(&ctx);
 
@@ -106,7 +106,7 @@ void datagram_decrypt(const void *key, const void *cptype, void *in,
 	EVP_CIPHER_CTX_init(&ctx);
 	assert(EVP_DecryptInit_ex(&ctx, cptype, NULL, key, iv));
 	EVP_CIPHER_CTX_set_padding(&ctx, 0);
-	assert(EVP_DecryptUpdate(&ctx, out, &outl, in, *dlen));
+	assert(EVP_DecryptUpdate(&ctx, out, &outl, in, (int)*dlen));
 	assert(EVP_DecryptFinal_ex(&ctx, (unsigned char *)out + outl, &outl2));
 	EVP_CIPHER_CTX_cleanup(&ctx);
 

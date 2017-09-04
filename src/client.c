@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 
 #include "minivtun.h"
+#include "client_route.h"
 
 #if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
   #include "client_route.h"
@@ -27,28 +28,18 @@
 
 static time_t last_recv = 0, last_keepalive = 0, current_ts = 0;
 
-// Handling packets received from Internet.
-static int network_receiving(int tunfd, int sockfd)
+// This would be called by both network_receiving() and NE codes 
+struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len, void * out_buffer, struct tun_pi * ppi)
 {
-	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
-	struct minivtun_msg *nmsg;
-	struct tun_pi pi;
 	void *out_data;
 	size_t ip_dlen, out_dlen;
-	struct sockaddr_in real_peer;
-	socklen_t real_peer_alen;
-	struct iovec iov[2];
-	int rc;
-
-	real_peer_alen = sizeof(real_peer);
-	rc = recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
-			(struct sockaddr *)&real_peer, &real_peer_alen);
-	if (rc <= 0)
-		return -1;
-
-	out_data = crypt_buffer;
-	out_dlen = (size_t)rc;
-	netmsg_to_local(read_buffer, &out_data, &out_dlen);
+	struct minivtun_msg * nmsg;
+	
+	out_data = out_buffer;
+	// out_dlen = (size_t)rc;
+	out_dlen = data_len;
+	// netmsg_to_local(read_buffer, &out_data, &out_dlen);
+	netmsg_to_local(data_buffer, &out_data, &out_dlen);
 	nmsg = out_data;
 
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
@@ -62,8 +53,10 @@ static int network_receiving(int tunfd, int sockfd)
 	last_recv = current_ts;
 
 	switch (nmsg->hdr.opcode) {
+
 	case MINIVTUN_MSG_KEEPALIVE:
 		break;
+
 	case MINIVTUN_MSG_IPDATA:
 		if (nmsg->ipdata.proto == htons(ETH_P_IP)) {
 			/* No packet is shorter than a 20-byte IPv4 header. */
@@ -82,20 +75,156 @@ static int network_receiving(int tunfd, int sockfd)
 		if (out_dlen - MINIVTUN_MSG_IPDATA_OFFSET < ip_dlen)
 			return 0;
 
+
 		// pi.flags = 0;
 		// pi.proto = nmsg->ipdata.proto;
 		// osx_ether_to_af(&pi.proto);
-		set_pi_with_ether_proto(&pi, ntohs(nmsg->ipdata.proto));
+		
+		// set_pi_with_ether_proto(&pi, ntohs(nmsg->ipdata.proto));
+		set_pi_with_ether_proto(ppi, ntohs(nmsg->ipdata.proto));
+		/*
 		iov[0].iov_base = &pi;
 		iov[0].iov_len = sizeof(pi);
 		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
 		iov[1].iov_len = ip_dlen;
 		rc = writev(tunfd, iov, 2);
 		break;
+		*/
+		return nmsg;
 	}
 
 	return 0;
 }
+
+
+#ifndef __APPLE_NETWORK_EXTENSION__
+
+// Handling packets received from Internet.
+static int network_receiving(int tunfd, int sockfd)
+{
+	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
+	struct minivtun_msg *nmsg;
+	struct tun_pi pi;
+	// void *out_data;
+	// size_t ip_dlen, out_dlen;
+	struct sockaddr_in real_peer;
+	socklen_t real_peer_alen;
+	struct iovec iov[2];
+	int rc;
+
+	real_peer_alen = sizeof(real_peer);
+	rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0, (struct sockaddr *)&real_peer, &real_peer_alen);
+
+#if DEBUG	
+    printf("Read %d bytes from network\n", rc);
+#endif
+
+	if (rc <= 0)
+		return 0;
+
+	nmsg = _network_data_handler(read_buffer, rc, crypt_buffer, &pi);
+
+#if DEBUG
+    if ( nmsg == 0 )
+	   printf("nmsg is NULL\n");
+	else
+	   dump_nmsg(nmsg);
+#endif	
+
+    if ( nmsg != 0 ) {
+  	    iov[0].iov_base = &pi;
+        iov[0].iov_len = sizeof(pi);
+    	iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
+		iov[1].iov_len = ntohs(nmsg->ipdata.ip_dlen); // ip_dlen;
+		rc = (int)writev(tunfd, iov, 2);
+#if DEBUG
+        printf("write to tunnel. return %d\n", rc);
+		if ( rc < 0 )
+		   perror("writev");
+#endif		
+	}
+
+	return 0;
+//	out_data = crypt_buffer;
+//	out_dlen = (size_t)rc;
+//	netmsg_to_local(read_buffer, &out_data, &out_dlen);
+//	nmsg = out_data;
+
+//	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
+//		return 0;
+ 
+	/* Verify password. */
+//	if (memcmp(nmsg->hdr.auth_key, config.crypto_key, 
+//		sizeof(nmsg->hdr.auth_key)) != 0)
+//		return 0;
+
+//	last_recv = current_ts;
+
+//	switch (nmsg->hdr.opcode) {
+//	case MINIVTUN_MSG_KEEPALIVE:
+//		break;
+//	case MINIVTUN_MSG_IPDATA:
+//		if (nmsg->ipdata.proto == htons(ETH_P_IP)) {
+			/* No packet is shorter than a 20-byte IPv4 header. */
+//			if (out_dlen < MINIVTUN_MSG_IPDATA_OFFSET + 20)
+//				return 0;
+//		} else if (nmsg->ipdata.proto == htons(ETH_P_IPV6)) {
+//			if (out_dlen < MINIVTUN_MSG_IPDATA_OFFSET + 40)
+//				return 0;
+//		} else {
+//			fprintf(stderr, "*** Invalid protocol: 0x%x.\n", ntohs(nmsg->ipdata.proto));
+//			return 0;
+//		}
+
+//		ip_dlen = ntohs(nmsg->ipdata.ip_dlen);
+		/* Drop incomplete IP packets. */
+//		if (out_dlen - MINIVTUN_MSG_IPDATA_OFFSET < ip_dlen)
+//			return 0;
+
+		// pi.flags = 0;
+		// pi.proto = nmsg->ipdata.proto;
+		// osx_ether_to_af(&pi.proto);
+//		set_pi_with_ether_proto(&pi, ntohs(nmsg->ipdata.proto));
+//		iov[0].iov_base = &pi;
+//		iov[0].iov_len = sizeof(pi);
+//		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
+//		iov[1].iov_len = ip_dlen;
+//		rc = writev(tunfd, iov, 2);
+//		break;
+//	}
+
+//	return 0;
+}
+
+#endif // __APPLE_NETWORK_EXTENSION__
+
+
+void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void ** out_data, size_t * out_dlen)
+{
+	// char crypt_buffer[NM_PI_BUFFER_SIZE];
+	// void *out_data;
+	// size_t ip_dlen, out_dlen;
+	struct minivtun_msg nmsg;
+
+	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
+	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
+	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
+	nmsg.ipdata.proto = htons(proto); // htons(get_ether_proto_from_pi(pi)); // pi->proto;
+	nmsg.ipdata.ip_dlen = htons(data_len); // htons(ip_dlen);
+	memcpy(nmsg.ipdata.data, data_buffer, data_len);
+	// nmsg.ipdata.ip_dlen = htons(ip_dlen);
+	// memcpy(nmsg.ipdata.data, pi + 1, ip_dlen);
+
+	/* Do encryption. */
+	// out_data = crypt_buffer;
+	// out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
+	// local_to_netmsg(&nmsg, &out_data, &out_dlen);	
+	*out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + data_len;
+	local_to_netmsg(&nmsg, out_data, out_dlen);
+}
+
+
+#ifndef __APPLE_NETWORK_EXTENSION__
 
 // Handling packets received from tunnel. That is, local applications send them to
 // outside.
@@ -103,12 +232,12 @@ static int tunnel_receiving(int tunfd, int sockfd)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
 	struct tun_pi *pi = (void *)read_buffer;
-	struct minivtun_msg nmsg;
+	// struct minivtun_msg nmsg;
 	void *out_data;
 	size_t ip_dlen, out_dlen;
 	int rc;
 
-	rc = read(tunfd, pi, NM_PI_BUFFER_SIZE);
+	rc = (int)read(tunfd, pi, NM_PI_BUFFER_SIZE);
 	if (rc < sizeof(struct tun_pi))
 		return -1;
 
@@ -129,28 +258,36 @@ static int tunnel_receiving(int tunfd, int sockfd)
 		return 0;
 	}
 
-    // TODO: Check china ip list, and do routing according to the result.
-	// If the destination is demestic, just forward the packet.
-	// If the desitnation is foreign, convert to netmsg
-	/*
-	if ( gfw_needs_to_be_crossed_over() ) {
-	   
-	}
-	*/
-    
-	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
-	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
-	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
-	nmsg.ipdata.proto = htons(get_ether_proto_from_pi(pi)); // pi->proto;
-	nmsg.ipdata.ip_dlen = htons(ip_dlen);
-	memcpy(nmsg.ipdata.data, pi + 1, ip_dlen);
+//	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
+//	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
+//	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
+//	nmsg.ipdata.proto = htons(get_ether_proto_from_pi(pi)); // pi->proto;
+//	nmsg.ipdata.ip_dlen = htons(ip_dlen);
+//	memcpy(nmsg.ipdata.data, pi + 1, ip_dlen);
 
 	/* Do encryption. */
-	out_data = crypt_buffer;
-	out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
-	local_to_netmsg(&nmsg, &out_data, &out_dlen);
+//	out_data = crypt_buffer;
+//	out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
+//	local_to_netmsg(&nmsg, &out_data, &out_dlen);
 
-	rc = send(sockfd, out_data, out_dlen, 0);
+    out_data = crypt_buffer;
+
+#if DEBUG
+    printf("Read %d bytes from tunnel\n", rc);
+#endif
+
+    _tunnel_data_handler(pi+1, ip_dlen, proto, &out_data, &out_dlen);
+
+	rc = (int)send(sockfd, out_data, out_dlen, 0);
+
+#if DEBUG
+    printf("tunnel -> network: %zu bytes. Write to network returned %d\n", out_dlen, rc);
+	for ( int i = 0; i < out_dlen; i++ )
+	    printf("0x%x, ", ((char *)out_data)[i]);
+	printf("\n");
+#endif	
+
+
 	/**
 	 * NOTICE: Don't update this on each tunnel packet
 	 * transmit. We always need to keep the local virtual IP
@@ -161,14 +298,12 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	return 0;
 }
 
-// Send leep-alive packet out
-static int peer_keepalive(int sockfd)
+#endif // __APPLE_NETWORK_EXTENSION__
+
+void _keepalive_make(void ** out_msg, size_t * out_len)
 {
-	char in_data[64], crypt_buffer[64];
+	char in_data[64]; //, crypt_buffer[64];
 	struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
-	void *out_msg;
-	size_t out_len;
-	int rc;
 
 	nmsg->hdr.opcode = MINIVTUN_MSG_KEEPALIVE;
 	memset(nmsg->hdr.rsv, 0x0, sizeof(nmsg->hdr.rsv));
@@ -176,11 +311,38 @@ static int peer_keepalive(int sockfd)
 	nmsg->keepalive.loc_tun_in = config.local_tun_in;
 	nmsg->keepalive.loc_tun_in6 = config.local_tun_in6;
 
-	out_msg = crypt_buffer;
-	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
-	local_to_netmsg(nmsg, &out_msg, &out_len);
+	// out_msg = crypt_buffer;
+	*out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
+	// local_to_netmsg(nmsg, &out_msg, &out_len);
+	local_to_netmsg(nmsg, out_msg, out_len);
+}
 
-	rc = send(sockfd, out_msg, out_len, 0);
+#ifndef __APPLE_NETWORK_EXTENSION__
+
+// Send keep-alive packet out
+static int peer_keepalive(int sockfd)
+{
+	// char in_data[64], crypt_buffer[64];
+	char crypt_buffer[64];
+	// struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
+	void *out_msg;
+	size_t out_len;
+	int rc;
+
+	// nmsg->hdr.opcode = MINIVTUN_MSG_KEEPALIVE;
+	// memset(nmsg->hdr.rsv, 0x0, sizeof(nmsg->hdr.rsv));
+	// memcpy(nmsg->hdr.auth_key, config.crypto_key, sizeof(nmsg->hdr.auth_key));
+	// nmsg->keepalive.loc_tun_in = config.local_tun_in;
+	// nmsg->keepalive.loc_tun_in6 = config.local_tun_in6;
+
+	out_msg = crypt_buffer;
+	// out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
+	// local_to_netmsg(nmsg, &out_msg, &out_len);
+
+    _keepalive_make(&out_msg, &out_len);
+
+	
+	rc = (int)send(sockfd, out_msg, out_len, 0);
 
 	/* Update 'last_keepalive' only when it's really sent out. */
 	if (rc > 0) {
@@ -240,6 +402,7 @@ static int try_resolve_and_connect(const char *peer_addr_pair, struct sockaddr_i
 
 	return sockfd;
 }
+
 
 // The entry. Called from main() in minivtun.c directly after ifconfig interfaces
 //
@@ -362,3 +525,4 @@ reconnect:
 	return 0;
 }
 
+#endif // __APPLE_NETWORK_EXTENSION__

@@ -19,7 +19,10 @@
 #define __u16 uint16_t
 #define __u8 uint8_t
 
+#ifndef bool
 #define bool char
+#endif
+
 #define true 1
 #define false 0
 
@@ -137,9 +140,7 @@ static inline bool is_valid_unicast_in6(struct in6_addr *in6)
 	}
   #endif // 0
 
-    #include <sys/sys_domain.h>    // SYSPROTO_CONTROL, AF_SYS_CONTROL
-    #include <sys/kern_control.h>  // sockaddr_ctl, ctl_info
-    #include <net/if_utun.h>       // UTUN_CONTROL_NAME
+//    #include <TargetConditionals.h>
 
     // Apple's utun has a 4 bytes head. IP == 0x02 (AF_INET), IPv6 == 0x1E (AF_INET6)
     struct tun_pi {

@@ -127,5 +127,12 @@ static inline void dump_nmsg(struct minivtun_msg * nmsg)
 
 #endif // DEBUG
 
+
+struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len, void * out_buffer, struct tun_pi * ppi);
+void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void ** out_data, size_t * out_dlen);
+void _keepalive_make(void **, size_t *);
+void set_config_params(const char * crypto_key);
+
+
 #endif /* __MINIVTUN_H */
 
