@@ -20,6 +20,9 @@
 
 #include "minivtun.h"
 
+#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
+  #include "client_route.h"
+#endif  
 
 struct minivtun_config config = {
 	.keepalive_timeo = 13,
@@ -381,7 +384,7 @@ int main(int argc, char *argv[])
 #ifdef __APPLE__
            // 1. Add a ifscoped default route for current default
 #else
-  #error Not implemented
+           // TODO:
 #endif			
 		}
 	}

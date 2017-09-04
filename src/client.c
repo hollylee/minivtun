@@ -21,6 +21,10 @@
 
 #include "minivtun.h"
 
+#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
+  #include "client_route.h"
+#endif
+
 static time_t last_recv = 0, last_keepalive = 0, current_ts = 0;
 
 // Handling packets received from Internet.
@@ -213,7 +217,9 @@ static int try_resolve_and_connect(const char *peer_addr_pair, struct sockaddr_i
 	//
 	if ( config.bind_to_addr[0] != 0 ) {
 	   struct sockaddr_in bind_in;
+#ifdef __APPLE__ // linux doesn't have this field.	   
 	   bind_in.sin_len = sizeof(struct sockaddr_in);
+#endif	   
 	   bind_in.sin_family = AF_INET;
 	   bind_in.sin_port = 0;
 	   inet_aton(config.bind_to_addr, &bind_in.sin_addr);

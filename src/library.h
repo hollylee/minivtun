@@ -172,7 +172,7 @@ static inline bool is_valid_unicast_in6(struct in6_addr *in6)
 
 #elif defined (__linux__)
 
-	#include <linux/if.h>
+	// #include <linux/if.h>
 	#include <linux/if_tun.h>
 
     static inline uint16_t get_ether_proto_from_pi(struct tun_pi * pi)
