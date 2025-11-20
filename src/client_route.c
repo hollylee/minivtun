@@ -12,7 +12,6 @@
 #include <ifaddrs.h>
 #include <errno.h>
 #include <stdlib.h>
-#include <sys/sysctl.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -27,6 +26,9 @@
   #include <unistd.h>
 #endif // __linux__
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 /* alignment constraint for routing socket */
 #define ROUNDUP(a) \

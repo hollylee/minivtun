@@ -17,6 +17,8 @@
 #include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/md5.h>
+#include <sys/types.h>
+#include <netdb.h>
 
 #include "library.h"
 
@@ -71,7 +73,7 @@ void datagram_encrypt(const void *key, const void *cptype, void *in,
 		void *out, size_t *dlen)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
-	EVP_CIPHER_CTX ctx;
+	EVP_CIPHER_CTX * ctx;
 	unsigned char iv[CRYPTO_MAX_KEY_SIZE];
 	int outl = 0, outl2 = 0;
 
@@ -80,12 +82,12 @@ void datagram_encrypt(const void *key, const void *cptype, void *in,
 
 	memcpy(iv, crypto_ivec_initdata, iv_len);
 	CRYPTO_DATA_PADDING(in, dlen, iv_len);
-	EVP_CIPHER_CTX_init(&ctx);
-	assert(EVP_EncryptInit_ex(&ctx, cptype, NULL, key, iv));
-	EVP_CIPHER_CTX_set_padding(&ctx, 0);
-	assert(EVP_EncryptUpdate(&ctx, out, &outl, in, (int)*dlen));
-	assert(EVP_EncryptFinal_ex(&ctx, (unsigned char *)out + outl, &outl2));
-	EVP_CIPHER_CTX_cleanup(&ctx);
+	ctx = EVP_CIPHER_CTX_new();
+	assert(EVP_EncryptInit_ex(ctx, cptype, NULL, key, iv));
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
+	assert(EVP_EncryptUpdate(ctx, out, &outl, in, (int)*dlen));
+	assert(EVP_EncryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2));
+	EVP_CIPHER_CTX_free(ctx);
 
 	*dlen = (size_t)(outl + outl2);
 }
@@ -94,7 +96,7 @@ void datagram_decrypt(const void *key, const void *cptype, void *in,
 		void *out, size_t *dlen)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
-	EVP_CIPHER_CTX ctx;
+	EVP_CIPHER_CTX * ctx;
 	unsigned char iv[CRYPTO_MAX_KEY_SIZE];
 	int outl = 0, outl2 = 0;
 
@@ -103,12 +105,12 @@ void datagram_decrypt(const void *key, const void *cptype, void *in,
 
 	memcpy(iv, crypto_ivec_initdata, iv_len);
 	CRYPTO_DATA_PADDING(in, dlen, iv_len);
-	EVP_CIPHER_CTX_init(&ctx);
-	assert(EVP_DecryptInit_ex(&ctx, cptype, NULL, key, iv));
-	EVP_CIPHER_CTX_set_padding(&ctx, 0);
-	assert(EVP_DecryptUpdate(&ctx, out, &outl, in, (int)*dlen));
-	assert(EVP_DecryptFinal_ex(&ctx, (unsigned char *)out + outl, &outl2));
-	EVP_CIPHER_CTX_cleanup(&ctx);
+	ctx = EVP_CIPHER_CTX_new();
+	assert(EVP_DecryptInit_ex(ctx, cptype, NULL, key, iv));
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
+	assert(EVP_DecryptUpdate(ctx, out, &outl, in, (int)*dlen));
+	assert(EVP_DecryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2));
+	EVP_CIPHER_CTX_free(ctx);
 
 	*dlen = (size_t)(outl + outl2);
 }
@@ -116,11 +118,19 @@ void datagram_decrypt(const void *key, const void *cptype, void *in,
 void fill_with_string_md5sum(const char *in, void *out, size_t outlen)
 {
 	char *outp = out, *oute = outp + outlen;
+	unsigned int realOutLen = 0;
+	/*
 	MD5_CTX ctx;
 
 	MD5_Init(&ctx);
 	MD5_Update(&ctx, in, strlen(in));
 	MD5_Final(out, &ctx);
+	*/
+	EVP_MD_CTX * ctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(ctx, EVP_md5(), NULL);
+	EVP_DigestUpdate(ctx, in, strlen(in));
+	EVP_DigestFinal(ctx, out, &realOutLen);
+	EVP_MD_CTX_free(ctx);
 
 	/* Fill in remaining buffer with repeated data. */
 	for (outp += 16; outp < oute; outp += 16) {
