@@ -35,6 +35,54 @@
 #include <openssl/rand.h>
 
 #include "list.h"
+
+/* -----------------------------------------------------------------------
+ * Debug packet dump helpers (enabled only when compiled with -DDEBUG=1)
+ * ----------------------------------------------------------------------- */
+#if DEBUG
+static void dbg_print_ip4(const char *tag,
+                           const uint8_t *pkt, size_t len)
+{
+	char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+	uint8_t proto;
+	uint16_t sport = 0, dport = 0;
+
+	if (len < 20) { fprintf(stderr, "[DBG] %s <short IPv4 %zu>\n", tag, len); return; }
+	inet_ntop(AF_INET, pkt + 12, src, sizeof(src));
+	inet_ntop(AF_INET, pkt + 16, dst, sizeof(dst));
+	proto = pkt[9];
+	uint8_t ihl = (pkt[0] & 0x0f) * 4;
+	if ((size_t)ihl + 4 <= len) {
+		sport = (uint16_t)((pkt[ihl] << 8) | pkt[ihl+1]);
+		dport = (uint16_t)((pkt[ihl+2] << 8) | pkt[ihl+3]);
+	}
+	const char *pname = (proto == 6) ? "TCP" : (proto == 17) ? "UDP" :
+	                    (proto == 1) ? "ICMP" : "?";
+	fprintf(stderr, "[DBG] %s IPv4 %s %s:%u -> %s:%u len=%zu\n",
+	        tag, pname, src, sport, dst, dport, len);
+}
+
+static void dbg_print_ip6(const char *tag,
+                           const uint8_t *pkt, size_t len)
+{
+	char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
+	uint8_t proto;
+	uint16_t sport = 0, dport = 0;
+
+	if (len < 40) { fprintf(stderr, "[DBG] %s <short IPv6 %zu>\n", tag, len); return; }
+	inet_ntop(AF_INET6, pkt + 8,  src, sizeof(src));
+	inet_ntop(AF_INET6, pkt + 24, dst, sizeof(dst));
+	proto = pkt[6];
+	if (40 + 4 <= len) {
+		sport = (uint16_t)((pkt[40] << 8) | pkt[41]);
+		dport = (uint16_t)((pkt[42] << 8) | pkt[43]);
+	}
+	const char *pname = (proto == 6) ? "TCP" : (proto == 17) ? "UDP" :
+	                    (proto == 58) ? "ICMPv6" : "?";
+	fprintf(stderr, "[DBG] %s IPv6 %s [%s]:%u -> [%s]:%u len=%zu\n",
+	        tag, pname, src, sport, dst, dport, len);
+}
+#endif /* DEBUG */
 #include "jhash.h"
 #include "minivtun.h"
 #include "pktbuf.h"
@@ -127,6 +175,12 @@ static void send_inner_to_peer(int sockfd, struct vpn_peer *peer,
 	alen = (peer->udp_addr.ss_family == AF_INET6)
 	       ? sizeof(struct sockaddr_in6)
 	       : sizeof(struct sockaddr_in);
+#if DEBUG
+	if (eth_proto == ETH_P_IP)
+		dbg_print_ip4("SERVER->CLIENT", (const uint8_t *)ip_pkt, ip_len);
+	else
+		dbg_print_ip6("SERVER->CLIENT", (const uint8_t *)ip_pkt, ip_len);
+#endif
 	sendto(sockfd, out_data, out_dlen, 0,
 	       (struct sockaddr *)&peer->udp_addr, alen);
 }
@@ -289,6 +343,15 @@ static void handle_client_tcp4(int sockfd,
 			return;
 		}
 		conn->state = TCP_CONNECTING;
+#if DEBUG
+		{
+			char s_src[INET_ADDRSTRLEN], s_dst[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &iph->saddr, s_src, sizeof(s_src));
+			inet_ntop(AF_INET, &iph->daddr, s_dst, sizeof(s_dst));
+			fprintf(stderr, "[DBG] TCP4 SYN %s:%u -> %s:%u (connecting)\n",
+			        s_src, clt_port, s_dst, dst_port);
+		}
+#endif
 		return;
 	}
 
@@ -428,6 +491,15 @@ static void handle_client_tcp6(int sockfd,
 			tcp_conn_remove(conn); return;
 		}
 		conn->state = TCP_CONNECTING;
+#if DEBUG
+		{
+			char s_src[INET6_ADDRSTRLEN], s_dst[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET6, ip6h->saddr, s_src, sizeof(s_src));
+			inet_ntop(AF_INET6, ip6h->daddr, s_dst, sizeof(s_dst));
+			fprintf(stderr, "[DBG] TCP6 SYN [%s]:%u -> [%s]:%u (connecting)\n",
+			        s_src, clt_port, s_dst, dst_port);
+		}
+#endif
 		return;
 	}
 
@@ -631,6 +703,15 @@ static void handle_client_udp4(int sockfd,
 			udp_flow_remove(flow);
 			return;
 		}
+#if DEBUG
+		{
+			char s_src[INET_ADDRSTRLEN], s_dst[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &iph->saddr, s_src, sizeof(s_src));
+			inet_ntop(AF_INET, &iph->daddr, s_dst, sizeof(s_dst));
+			fprintf(stderr, "[DBG] UDP4 NEW %s:%u -> %s:%u\n",
+			        s_src, clt_port, s_dst, dst_port);
+		}
+#endif
 	}
 
 	send(flow->fd, payload, payload_len, 0);
@@ -677,6 +758,15 @@ static void handle_client_udp6(int sockfd,
 		            sizeof(dst_addr)) < 0) {
 			udp_flow_remove(flow); return;
 		}
+#if DEBUG
+		{
+			char s_src[INET6_ADDRSTRLEN], s_dst[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET6, ip6h->saddr, s_src, sizeof(s_src));
+			inet_ntop(AF_INET6, ip6h->daddr, s_dst, sizeof(s_dst));
+			fprintf(stderr, "[DBG] UDP6 NEW [%s]:%u -> [%s]:%u\n",
+			        s_src, clt_port, s_dst, dst_port);
+		}
+#endif
 	}
 
 	send(flow->fd, payload, payload_len, 0);
@@ -859,6 +949,14 @@ static void handle_client_icmp4(int sockfd,
 
 	sendto(flow->fd, icmp_buf, PB_ICMP_HDR_LEN + icmp_data_len, 0,
 	       (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+#if DEBUG
+	{
+		char s_dst[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &iph->daddr, s_dst, sizeof(s_dst));
+		fprintf(stderr, "[DBG] ICMP4 ECHO id=%u seq=%u -> %s (mapped_id=%u)\n",
+		        orig_id, orig_seq, s_dst, flow->mapped_id);
+	}
+#endif
 	flow->last_active = time(NULL);
 	(void)sockfd;
 }
@@ -928,6 +1026,14 @@ static void handle_client_icmpv6(int sockfd,
 
 	sendto(flow->fd, icmp_buf, PB_ICMP_HDR_LEN + icmp_data_len, 0,
 	       (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+#if DEBUG
+	{
+		char s_dst[INET6_ADDRSTRLEN];
+		inet_ntop(AF_INET6, ip6h->daddr, s_dst, sizeof(s_dst));
+		fprintf(stderr, "[DBG] ICMP6 ECHO id=%u seq=%u -> [%s] (mapped_id=%u)\n",
+		        orig_id, orig_seq, s_dst, flow->mapped_id);
+	}
+#endif
 	flow->last_active = time(NULL);
 	(void)sockfd;
 }
@@ -1123,6 +1229,14 @@ static void network_receiving(int sockfd)
 			break;
 		memcpy(&ka_in4, &nmsg->keepalive.loc_tun_in,  sizeof(ka_in4));
 		memcpy(&ka_in6, &nmsg->keepalive.loc_tun_in6, sizeof(ka_in6));
+#if DEBUG
+		{
+			char s4[INET_ADDRSTRLEN], s6[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET,  &ka_in4, s4, sizeof(s4));
+			inet_ntop(AF_INET6, &ka_in6, s6, sizeof(s6));
+			fprintf(stderr, "[DBG] KEEPALIVE from peer vip4=%s vip6=%s\n", s4, s6);
+		}
+#endif
 		if (is_valid_unicast_in(&ka_in4)) {
 			peer = peer_get_or_create(AF_INET, &ka_in4, &real_peer);
 			if (peer) peer->last_active = time(NULL);
@@ -1172,6 +1286,13 @@ static void network_receiving(int sockfd)
 			break;
 
 		peer->last_active = time(NULL);
+
+#if DEBUG
+		if (af == AF_INET)
+			dbg_print_ip4("CLIENT->SERVER", ip_pkt, ip_dlen);
+		else
+			dbg_print_ip6("CLIENT->SERVER", ip_pkt, ip_dlen);
+#endif
 
 		if (af == AF_INET)
 			dispatch_ipv4(sockfd, ip_pkt, ip_dlen, peer);
