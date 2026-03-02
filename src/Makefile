@@ -10,14 +10,14 @@ endif
 
 CC ?= gcc
 CFLAGS += -Wall -I/opt/local/include 
-HEADERS = minivtun.h library.h list.h jhash.h
+HEADERS = minivtun.h library.h list.h jhash.h pktbuf.h natmap.h
 LDFLAGS += -L/opt/local/lib -lcrypto
 
 ifneq ($(DEBUG),)
 CFLAGS += -DDEBUG=1 -g
 endif
 
-minivtun: minivtun.o library.o server.o client.o client_route.o
+minivtun: minivtun.o library.o server.o client.o client_route.o pktbuf.o natmap.o
 	$(CC) $(LDFLAGS) -o $@ $^ -lcrypto
 
 %.o: %.c $(HEADERS)
