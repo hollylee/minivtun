@@ -66,6 +66,7 @@ static struct option long_opts[] = {
 	{ "help", no_argument, 0, 'h', },
 	{ "send-all-traffic", no_argument, 0, 'f' },
 	{ "bind-to-addr", required_argument, 0, 'b' },
+	{ "random-iv", no_argument, 0, 'i' },
 	{ 0, 0, 0, 0, },
 };
 
@@ -95,6 +96,8 @@ static void print_help(int argc, char *argv[])
 	printf("  -d, --daemon                        run as daemon process\n");
 	printf("  -f, --send-all-traffic              send all traffic through the tunnel\n");
 	printf("  -b, --bind-to-addr <addr>           bind to specified address. If omitted, would be bound to the address with the first default route.");
+	printf("  -i, --random-iv                     use a fresh random IV per packet (new wire format;\n");
+	printf("                                      both peers must use this option, incompatible with default mode)\n");
 	printf("  -h, --help                          print this help\n");
 	printf("Supported encryption types:\n");
 	printf("  ");
@@ -250,7 +253,7 @@ int main(int argc, char *argv[])
 	char cmd[256];
 	int tunfd, opt;
 
-	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:b:dwhf",
+	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:b:dwhfi",
 			long_opts, NULL)) != -1) {
 
 		switch (opt) {
@@ -306,6 +309,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'b':
 			strncpy(config.bind_to_addr, optarg, sizeof(config.bind_to_addr) - 1);
+			break;
+		case 'i':
+			config.random_iv = true;
 			break;
 		case '?':
 			exit(1);

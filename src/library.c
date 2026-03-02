@@ -22,6 +22,7 @@
 #include <netdb.h>
 
 #include "library.h"
+#include "minivtun.h"
 
 struct name_cipher_pair cipher_pairs[] = {
 	{ "aes-128", EVP_aes_128_cbc, },
@@ -53,6 +54,14 @@ const void *get_crypto_type(const char *name)
 	}
 }
 
+/* Hardcoded IV used when --random-iv is not specified (legacy wire format). */
+static const unsigned char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
+	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
+	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
+	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
+	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
+};
+
 void datagram_encrypt(const void *key, const void *cptype, void *in,
 		void *out, size_t *dlen)
 {
@@ -63,37 +72,43 @@ void datagram_encrypt(const void *key, const void *cptype, void *in,
 	size_t orig_len = *dlen;
 	size_t last, padded_len;
 	uint8_t *outbuf = (uint8_t *)out;
+	size_t data_offset;
 
 	if (iv_len == 0)
 		iv_len = 16;
 
-	/* Generate a fresh random IV for every message. */
-	if (RAND_bytes(iv, (int)iv_len) != 1)
-		memset(iv, 0, iv_len);  /* fallback: zero IV (still better than fixed) */
+	if (config.random_iv) {
+		/* Generate a fresh random IV for every message and prepend it. */
+		if (RAND_bytes(iv, (int)iv_len) != 1)
+			memset(iv, 0, iv_len);
+		memcpy(outbuf, iv, iv_len);
+		data_offset = iv_len;
+	} else {
+		/* Legacy mode: fixed IV, no IV prefix in the wire packet. */
+		memcpy(iv, crypto_ivec_initdata, iv_len);
+		data_offset = 0;
+	}
 
-	/* Prepend the IV to the output buffer. */
-	memcpy(outbuf, iv, iv_len);
-
-	/* Copy plaintext after the IV; zero-pad to the next block boundary. */
+	/* Zero-pad plaintext to next block boundary, then encrypt in-place. */
 	last = orig_len % iv_len;
 	padded_len = last ? orig_len + (iv_len - last) : orig_len;
-	memcpy(outbuf + iv_len, in, orig_len);
+	memcpy(outbuf + data_offset, in, orig_len);
 	if (padded_len > orig_len)
-		memset(outbuf + iv_len + orig_len, 0, padded_len - orig_len);
+		memset(outbuf + data_offset + orig_len, 0, padded_len - orig_len);
 
 	ctx = EVP_CIPHER_CTX_new();
 	if (!ctx) { *dlen = 0; return; }
 	if (!EVP_EncryptInit_ex(ctx, cptype, NULL, key, iv))
 		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
 	EVP_CIPHER_CTX_set_padding(ctx, 0);
-	if (!EVP_EncryptUpdate(ctx, outbuf + iv_len, &outl,
-	                       outbuf + iv_len, (int)padded_len))
+	if (!EVP_EncryptUpdate(ctx, outbuf + data_offset, &outl,
+	                       outbuf + data_offset, (int)padded_len))
 		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
-	if (!EVP_EncryptFinal_ex(ctx, outbuf + iv_len + outl, &outl2))
+	if (!EVP_EncryptFinal_ex(ctx, outbuf + data_offset + outl, &outl2))
 		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
 	EVP_CIPHER_CTX_free(ctx);
 
-	*dlen = iv_len + (size_t)(outl + outl2);
+	*dlen = data_offset + (size_t)(outl + outl2);
 }
 
 void datagram_decrypt(const void *key, const void *cptype, void *in,
@@ -108,13 +123,16 @@ void datagram_decrypt(const void *key, const void *cptype, void *in,
 	if (iv_len == 0)
 		iv_len = 16;
 
-	/* Need at least the IV prefix before any ciphertext. */
-	if (*dlen <= iv_len) { *dlen = 0; return; }
-
-	/* Extract per-message IV from the front of the packet. */
-	memcpy(iv, inbuf, iv_len);
-	inbuf  += iv_len;
-	*dlen  -= iv_len;
+	if (config.random_iv) {
+		/* Extract the per-message IV from the front of the packet. */
+		if (*dlen <= iv_len) { *dlen = 0; return; }
+		memcpy(iv, inbuf, iv_len);
+		inbuf  += iv_len;
+		*dlen  -= iv_len;
+	} else {
+		/* Legacy mode: fixed IV, ciphertext starts at byte 0. */
+		memcpy(iv, crypto_ivec_initdata, iv_len);
+	}
 
 	ctx = EVP_CIPHER_CTX_new();
 	if (!ctx) { *dlen = 0; return; }

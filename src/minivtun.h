@@ -31,6 +31,7 @@ struct minivtun_config {
 	int send_all_traffic;
 	char bind_to_addr[64];
 	char bind_if[IFNAMSIZ];
+	bool random_iv;   /* -i: per-message random IV (new wire format) */
 };
 
 enum {
