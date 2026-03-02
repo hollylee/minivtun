@@ -1,52 +1,72 @@
 /*
- * Copyright (c) 2015 Justin Liu
- * Author: Justin Liu <rssnsj@gmail.com>
- * https://github.com/rssnsj/minivtun
+ * server.c - Userspace NAT/routing server for minivtun
+ *
+ * Replaces the old TUN-based server.  All packet forwarding and NAT is
+ * done entirely in userspace using regular OS sockets.  No TUN interface,
+ * no kernel IP forwarding, no iptables required.
+ *
+ * Features:
+ *   - Multi-client: arbitrary number of simultaneous VPN clients
+ *   - Inter-client routing: packets between clients are forwarded directly
+ *   - External NAT (IPv4 and IPv6): TCP, UDP, ICMP relayed via real sockets
+ *   - Linux and macOS support
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <time.h>
 #include <signal.h>
-#include <assert.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
 #include <fcntl.h>
-#include <sys/uio.h>
-#include <arpa/inet.h>
+#include <assert.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+
+#ifdef __linux__
+#  include <netinet/icmp6.h>
+#  include <netinet/ip6.h>
+#endif
+
+#include <openssl/rand.h>
 
 #include "list.h"
 #include "jhash.h"
 #include "minivtun.h"
+#include "pktbuf.h"
+#include "natmap.h"
 
-/* Timestamp for each loop. */
-static time_t current_ts = 0;
-static uint32_t hash_initval = 0;
+/* Maximum number of poll() entries (1 VPN socket + NAT sockets) */
+#define MAX_POLL_FDS  4096
 
-/**
- * Pseudo route table for binding client side subnets
- * to corresponding connected virtual addresses.
- */
+/* -----------------------------------------------------------------------
+ * Virtual route table (reused from old server; used for subnet routing)
+ * ----------------------------------------------------------------------- */
+
 struct vt_route {
 	struct in_addr network;
 	struct in_addr netmask;
 	struct in_addr gateway;
 };
-#define VIRTUAL_ROUTE_MAX  (32)
-static struct vt_route *vt_routes[VIRTUAL_ROUTE_MAX];
-static unsigned vt_routes_len = 0; 
 
-int vt_route_add(struct in_addr *network, unsigned prefix, struct in_addr *gateway)
+#define VIRTUAL_ROUTE_MAX  32
+static struct vt_route *vt_routes[VIRTUAL_ROUTE_MAX];
+static unsigned vt_routes_len = 0;
+
+int vt_route_add(struct in_addr *network, unsigned prefix,
+                 struct in_addr *gateway)
 {
 	struct vt_route *rt;
 	uint32_t mask;
 
 	if (prefix == 0) {
 		mask = 0;
+	} else if (prefix > 32) {
+		return -1;
 	} else {
 		mask = ~((1U << (32 - prefix)) - 1) & 0xffffffff;
 	}
@@ -56,709 +76,1224 @@ int vt_route_add(struct in_addr *network, unsigned prefix, struct in_addr *gatew
 		return -1;
 	}
 
-	rt = malloc(sizeof(struct vt_route));
+	rt = malloc(sizeof(*rt));
+	if (!rt) return -1;
 	rt->netmask.s_addr = htonl(mask);
 	rt->network.s_addr = network->s_addr & rt->netmask.s_addr;
-	rt->gateway = *gateway;
+	rt->gateway        = *gateway;
 	vt_routes[vt_routes_len++] = rt;
-
 	return 0;
 }
 
 static struct in_addr *vt_route_lookup(const struct in_addr *addr)
 {
 	unsigned i;
-
 	for (i = 0; i < vt_routes_len; i++) {
 		struct vt_route *rt = vt_routes[i];
-		
-		printf("0x%08x,0x%08x,0x%08x\n", addr->s_addr, rt->netmask.s_addr, rt->network.s_addr);
 		if ((addr->s_addr & rt->netmask.s_addr) == rt->network.s_addr)
 			return &rt->gateway;
 	}
-
 	return NULL;
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* -----------------------------------------------------------------------
+ * Helper: send an inner IP packet back to a VPN client
+ * ----------------------------------------------------------------------- */
 
-struct ra_entry {
-	struct list_head list;
-	struct sockaddr_inx real_addr;
-	time_t last_recv;
-	time_t last_xmit;
-	int refs;
-};
-
-/* Hash table for dedicated clients (real addresses). */
-#define RA_SET_HASH_SIZE  (1 << 3)
-#define RA_SET_LIMIT_EACH_WALK  (10)
-static struct list_head ra_set_hbase[RA_SET_HASH_SIZE];
-static unsigned ra_set_len;
-
-static inline uint32_t real_addr_hash(const struct sockaddr_inx *sa)
+static void send_inner_to_peer(int sockfd, struct vpn_peer *peer,
+                                uint16_t eth_proto,
+                                const void *ip_pkt, size_t ip_len)
 {
-	if (sa->sa.sa_family == AF_INET6) {
-		return jhash_2words(sa->sa.sa_family, sa->in6.sin6_port,
-			jhash2((uint32_t *)&sa->in6.sin6_addr, 4, hash_initval));
-	} else {
-		return jhash_3words(sa->sa.sa_family, sa->in.sin_port,
-			sa->in.sin_addr.s_addr, hash_initval);
-	}
-}
-
-static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa)
-{
-	struct list_head *chain = &ra_set_hbase[
-		real_addr_hash(sa) & (RA_SET_HASH_SIZE - 1)];
-	struct ra_entry *re;
-	char s_real_addr[50];
-
-	list_for_each_entry (re, chain, list) {
-		if (is_sockaddr_equal(&re->real_addr, sa)) {
-			re->refs++;
-			return re;
-		}
-	}
-
-	if ((re = malloc(sizeof(*re))) == NULL) {
-		fprintf(stderr, "*** [%s] malloc(): %s.\n", __FUNCTION__,
-				strerror(errno));
-		return NULL;
-	}
-
-	re->real_addr = *sa;
-	re->refs = 1;
-	list_add_tail(&re->list, chain);
-	ra_set_len++;
-
-	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
-			  s_real_addr, sizeof(s_real_addr));
-	printf("New client [%s:%u]\n", s_real_addr, port_of_sockaddr(&re->real_addr));
-
-	return re;
-}
-
-static inline void ra_put_no_free(struct ra_entry *re)
-{
-	assert(re->refs > 0);
-	re->refs--;
-}
-
-static inline void ra_entry_release(struct ra_entry *re)
-{
-	char s_real_addr[50];
-
-	assert(re->refs == 0);
-	list_del(&re->list);
-	ra_set_len--;
-
-	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
-			  s_real_addr, sizeof(s_real_addr));
-	printf("Recycled client [%s:%u]\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)));
-
-	free(re);
-}
-
-struct tun_addr {
-	unsigned short af;
-	union {
-		struct in_addr in;
-		struct in6_addr in6;
-	};
-};
-struct tun_client {
-	struct list_head list;
-	struct tun_addr virt_addr;
-	struct ra_entry *ra;
-	time_t last_recv;
-	time_t last_xmit;
-};
-
-/* Hash table of virtual address in tunnel. */
-#define VA_MAP_HASH_SIZE  (1 << 4)
-#define VA_MAP_LIMIT_EACH_WALK  (10)
-static struct list_head va_map_hbase[VA_MAP_HASH_SIZE];
-static unsigned va_map_len;
-
-static inline void init_va_ra_maps(void)
-{
-	int i;
-
-	for (i = 0; i < VA_MAP_HASH_SIZE; i++)
-		INIT_LIST_HEAD(&va_map_hbase[i]);
-	va_map_len = 0;
-
-	for (i = 0; i < RA_SET_HASH_SIZE; i++)
-		INIT_LIST_HEAD(&ra_set_hbase[i]);
-	ra_set_len = 0;
-}
-
-static inline uint32_t tun_addr_hash(const struct tun_addr *addr)
-{
-	if (addr->af == AF_INET) {
-		return jhash_2words(addr->af, addr->in.s_addr, hash_initval);
-	} else if (addr->af == AF_INET6) {
-		const __be32 *aa = (void *)&addr->in6;
-		return jhash_2words(aa[2], aa[3],
-			jhash_3words(addr->af, aa[0], aa[1], hash_initval));
-	} else {
-		abort();
-		return 0;
-	}
-}
-
-static inline int tun_addr_comp(
-		const struct tun_addr *a1, const struct tun_addr *a2)
-{
-	if (a1->af != a2->af)
-		return 1;
-
-	if (a1->af == AF_INET) {
-		if (a1->in.s_addr == a2->in.s_addr) {
-			return 0;
-		} else {
-			return 1;
-		}
-	} else if (a1->af == AF_INET6) {
-		if (is_in6_equal(&a1->in6, &a2->in6)) {
-			return 0;
-		} else {
-			return 1;
-		}
-	} else {
-		abort();
-		return 0;
-	}
-}
-
-#if 0
-static inline void tun_client_dump(struct tun_client *ce)
-{
-	char s_virt_addr[50] = "", s_real_addr[50] = "";
-
-	inet_ntop(ce->virt_addr.af, &ce->virt_addr.in, s_virt_addr,
-			  sizeof(s_virt_addr));
-	inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
-			  s_real_addr, sizeof(s_real_addr));
-	printf("[%s] (%s:%u), last_recv: %lu, last_xmit: %lu\n", s_virt_addr,
-			s_real_addr, ntohs(port_of_sockaddr(&ce->ra->real_addr)),
-			(unsigned long)ce->last_recv, (unsigned long)ce->last_xmit);
-}
-#endif
-
-static inline void tun_client_release(struct tun_client *ce)
-{
-	char s_virt_addr[50], s_real_addr[50];
-
-	inet_ntop(ce->virt_addr.af, &ce->virt_addr.in, s_virt_addr,
-			  sizeof(s_virt_addr));
-	inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
-			  s_real_addr, sizeof(s_real_addr));
-	printf("Recycled virtual address [%s] at [%s:%u].\n", s_virt_addr, s_real_addr,
-			ntohs(port_of_sockaddr(&ce->ra->real_addr)));
-
-	ra_put_no_free(ce->ra);
-
-	list_del(&ce->list);
-	va_map_len--;
-
-	free(ce);
-}
-
-static struct tun_client *tun_client_try_get(const struct tun_addr *vaddr)
-{
-	struct list_head *chain = &va_map_hbase[
-		tun_addr_hash(vaddr) & (VA_MAP_HASH_SIZE - 1)];
-	struct tun_client *ce;
-
-	list_for_each_entry (ce, chain, list) {
-		if (tun_addr_comp(&ce->virt_addr, vaddr) == 0)
-			return ce;
-	}
-	return NULL;
-}
-
-static struct tun_client *tun_client_get_or_create(
-		const struct tun_addr *vaddr, const struct sockaddr_inx *raddr)
-{
-	struct list_head *chain = &va_map_hbase[
-		tun_addr_hash(vaddr) & (VA_MAP_HASH_SIZE - 1)];
-	struct tun_client *ce, *__ce;
-	char s_virt_addr[50], s_real_addr[50];
-
-	list_for_each_entry_safe (ce, __ce, chain, list) {
-		if (tun_addr_comp(&ce->virt_addr, vaddr) == 0) {
-			if (!is_sockaddr_equal(&ce->ra->real_addr, raddr)) {
-				/* Real address changed, reassign a new entry for it. */
-				ra_put_no_free(ce->ra);
-				if ((ce->ra = ra_get_or_create(raddr)) == NULL) {
-					tun_client_release(ce);
-					return NULL;
-				}
-			}
-			return ce;
-		}
-	}
-
-	/* Not found, always create new entry. */
-	if ((ce = malloc(sizeof(*ce))) == NULL) {
-		fprintf(stderr, "*** [%s] malloc(): %s.\n", __FUNCTION__,
-				strerror(errno));
-		return NULL;
-	}
-
-	ce->virt_addr = *vaddr;
-
-	/* Get real_addr entry before adding to list. */
-	if ((ce->ra = ra_get_or_create(raddr)) == NULL) {
-		free(ce);
-		return NULL;
-	}
-	list_add_tail(&ce->list, chain);
-	va_map_len++;
-
-	inet_ntop(ce->virt_addr.af, &ce->virt_addr.in, s_virt_addr,
-			  sizeof(s_virt_addr));
-	inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
-			  s_real_addr, sizeof(s_real_addr));
-	printf("New virtual address [%s] at [%s:%u].\n", s_virt_addr, s_real_addr,
-			ntohs(port_of_sockaddr(&ce->ra->real_addr)));
-
-	return ce;
-}
-
-/**
- * Send keep-alive packet to the corresponding client
- * with information stored in 're'.
- */
-static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
-{
-	char in_data[64], crypt_buffer[64];
-	struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
-	void *out_msg;
-	size_t out_len;
-	int rc;
-
-	nmsg->hdr.opcode = MINIVTUN_MSG_KEEPALIVE;
-	memset(nmsg->hdr.rsv, 0x0, sizeof(nmsg->hdr.rsv));
-	memcpy(nmsg->hdr.auth_key, config.crypto_key, sizeof(nmsg->hdr.auth_key));
-	nmsg->keepalive.loc_tun_in = config.local_tun_in;
-	nmsg->keepalive.loc_tun_in6 = config.local_tun_in6;
-
-	out_msg = crypt_buffer;
-	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
-	local_to_netmsg(nmsg, &out_msg, &out_len);
-
-	rc = (int)sendto(sockfd, out_msg, out_len, 0, (struct sockaddr *)&re->real_addr,
-				sizeof_sockaddr(&re->real_addr));
-
-	/* Update 'last_xmit' only when it's really sent out. */
-	if (rc > 0) {
-		re->last_xmit = current_ts;
-	}
-
-	return rc;
-}
-
-static void va_ra_walk_continue(int sockfd)
-{
-	static unsigned va_index = 0, ra_index = 0;
-	unsigned va_walk_max = VA_MAP_LIMIT_EACH_WALK, va_count = 0;
-	unsigned ra_walk_max = RA_SET_LIMIT_EACH_WALK, ra_count = 0;
-	unsigned __va_index = va_index, __ra_index = ra_index;
-	struct tun_client *ce, *__ce;
-	struct ra_entry *re, *__re;
-
-	if (va_walk_max > va_map_len)
-		va_walk_max = va_map_len;
-	if (ra_walk_max > ra_set_len)
-		ra_walk_max = ra_set_len;
-
-	/* Recycle timeout virtual address entries. */
-	if (va_walk_max > 0) {
-		do {
-			list_for_each_entry_safe (ce, __ce, &va_map_hbase[va_index], list) {
-				//tun_client_dump(ce);
-				if (current_ts - ce->last_recv > config.reconnect_timeo) {
-					tun_client_release(ce);
-				}
-				va_count++;
-			}
-			va_index = (va_index + 1) & (VA_MAP_HASH_SIZE - 1);
-		} while (va_count < va_walk_max && va_index != __va_index);
-	}
-
-	/* Recycle or keep-alive real client addresses. */
-	if (ra_walk_max > 0) {
-		do {
-			list_for_each_entry_safe (re, __re, &ra_set_hbase[ra_index], list) {
-				if (current_ts - re->last_recv > config.reconnect_timeo) {
-					if (re->refs == 0) {
-						ra_entry_release(re);
-					}
-				} else if (current_ts - re->last_xmit > config.keepalive_timeo) {
-					ra_entry_keepalive(re, sockfd);
-				}
-				ra_count++;
-			}
-			ra_index = (ra_index + 1) & (RA_SET_HASH_SIZE - 1);
-		} while (ra_count < ra_walk_max && ra_index != __ra_index);
-	}
-
-	printf("Online clients: %u, addresses: %u\n", ra_set_len, va_map_len);
-}
-
-static inline void source_addr_of_ipdata(
-		const void *data, unsigned char af, struct tun_addr *addr)
-{
-	addr->af = af;
-	switch (af) {
-	case AF_INET:
-		memcpy(&addr->in, (char *)data + 12, 4);
-		break;
-	case AF_INET6:
-		memcpy(&addr->in6, (char *)data + 8, 16);
-		break;
-	default:
-		abort();
-	}
-}
-
-static inline void dest_addr_of_ipdata(
-		const void *data, unsigned char af, struct tun_addr *addr)
-{
-	addr->af = af;
-	switch (af) {
-	case AF_INET:
-		memcpy(&addr->in, (char *)data + 16, 4);
-		break;
-	case AF_INET6:
-		memcpy(&addr->in6, (char *)data + 24, 16);
-		break;
-	default:
-		abort();
-	}
-}
-
-// This would get called when we have data to receive from a normal interface, i.e. from sockfd
-static int network_receiving(int tunfd, int sockfd)
-{
-	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
-	struct minivtun_msg *nmsg;
-	struct tun_pi pi;
+	char crypt_buffer[NM_CRYPTO_BUF_SIZE];
+	struct minivtun_msg nmsg;
 	void *out_data;
-	size_t ip_dlen, out_dlen;
-	unsigned short af = 0;
-	struct tun_addr virt_addr;
-	struct tun_client *ce;
-	struct ra_entry *re;
-	struct sockaddr_inx real_peer;
-	socklen_t real_peer_alen;
-	struct iovec iov[2];
-	int rc;
+	size_t out_dlen;
+	socklen_t alen;
 
-    // 1. Read a 'struct sockaddr_inx' from sockfd 
-	real_peer_alen = sizeof(real_peer);
-	rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
-			(struct sockaddr *)&real_peer, &real_peer_alen);
-	if (rc <= 0)
-		return 0;
+	if (ip_len > sizeof(nmsg.ipdata.data))
+		return;
 
-#if DEBUG
-    printf("network_receiving: received %d bytes\n", rc);
-	hexdump(read_buffer, rc);
-#endif
+	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
+	memset(nmsg.hdr.rsv, 0, sizeof(nmsg.hdr.rsv));
+	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
+	nmsg.ipdata.proto  = htons(eth_proto);
+	nmsg.ipdata.ip_dlen = htons((uint16_t)ip_len);
+	memcpy(nmsg.ipdata.data, ip_pkt, ip_len);
 
 	out_data = crypt_buffer;
+	out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_len;
+	local_to_netmsg(&nmsg, &out_data, &out_dlen);
+
+	alen = (peer->udp_addr.ss_family == AF_INET6)
+	       ? sizeof(struct sockaddr_in6)
+	       : sizeof(struct sockaddr_in);
+	sendto(sockfd, out_data, out_dlen, 0,
+	       (struct sockaddr *)&peer->udp_addr, alen);
+}
+
+/* -----------------------------------------------------------------------
+ * Inter-client routing: forward inner packet to another VPN peer
+ * ----------------------------------------------------------------------- */
+
+static void forward_to_peer(int sockfd, struct vpn_peer *dst_peer,
+                             uint16_t eth_proto,
+                             const void *ip_pkt, size_t ip_len)
+{
+	send_inner_to_peer(sockfd, dst_peer, eth_proto, ip_pkt, ip_len);
+}
+
+/* -----------------------------------------------------------------------
+ * Resolve destination VPN peer for an inner IPv4 packet
+ * (direct peer match, then subnet route table)
+ * ----------------------------------------------------------------------- */
+
+static struct vpn_peer *resolve_peer_ipv4(const struct in_addr *dst)
+{
+	struct vpn_peer *p = peer_find_by_vip4(dst);
+	if (p) return p;
+
+	/* Try the virtual route table (subnet → gateway peer) */
+	if (vt_routes_len > 0) {
+		struct in_addr *gw = vt_route_lookup(dst);
+		if (gw) return peer_find_by_vip4(gw);
+	}
+	return NULL;
+}
+
+static struct vpn_peer *resolve_peer_ipv6(const struct in6_addr *dst)
+{
+	return peer_find_by_vip6(dst);
+}
+
+/* -----------------------------------------------------------------------
+ * TCP NAT handlers
+ * ----------------------------------------------------------------------- */
+
+/* Send a synthesized IPv4 TCP segment to the VPN client */
+static void tcp4_to_client(int sockfd, struct tcp_conn *conn,
+                            uint8_t flags,
+                            const uint8_t *opt, uint8_t opt_len,
+                            const void *data, size_t data_len)
+{
+	uint8_t pkt[PB_MAX_PKT];
+	int len;
+
+	len = pb_build_tcp4(pkt, sizeof(pkt),
+	                    conn->dst_ip4.s_addr, conn->clt_vip4.s_addr,
+	                    conn->dst_port, conn->clt_port,
+	                    conn->srv_seq, conn->clt_seq,
+	                    flags, 65535,
+	                    opt, opt_len,
+	                    data, data_len);
+	if (len > 0)
+		send_inner_to_peer(sockfd, conn->peer, ETH_P_IP, pkt, (size_t)len);
+}
+
+static void tcp6_to_client(int sockfd, struct tcp_conn *conn,
+                            uint8_t flags,
+                            const uint8_t *opt, uint8_t opt_len,
+                            const void *data, size_t data_len)
+{
+	uint8_t pkt[PB_MAX_PKT];
+	int len;
+
+	len = pb_build_tcp6(pkt, sizeof(pkt),
+	                    conn->dst_ip6.s6_addr, conn->clt_vip6.s6_addr,
+	                    conn->dst_port, conn->clt_port,
+	                    conn->srv_seq, conn->clt_seq,
+	                    flags, 65535,
+	                    opt, opt_len,
+	                    data, data_len);
+	if (len > 0)
+		send_inner_to_peer(sockfd, conn->peer, ETH_P_IPV6, pkt, (size_t)len);
+}
+
+/* Process an incoming TCP packet from a VPN client (IPv4) */
+static void handle_client_tcp4(int sockfd,
+                                const struct pb_iphdr *iph, size_t ip_len,
+                                struct vpn_peer *peer)
+{
+	uint8_t ihl = (iph->ihl_ver & 0x0f) * 4;
+	const struct pb_tcphdr *tcph;
+	uint16_t clt_port, dst_port;
+	uint16_t tcp_hdr_len;
+	uint32_t seq;
+	uint8_t flags;
+	const uint8_t *payload;
+	size_t payload_len;
+	struct tcp_conn *conn;
+	struct sockaddr_in dst_addr;
+
+	if (ihl < PB_IPV4_HDR_LEN)
+		return;
+
+	if (ip_len < (size_t)ihl + PB_TCP_HDR_LEN)
+		return;
+
+	tcph      = (const struct pb_tcphdr *)((const uint8_t *)iph + ihl);
+	clt_port  = ntohs(tcph->sport);
+	dst_port  = ntohs(tcph->dport);
+	seq       = ntohl(tcph->seq);
+	flags     = tcph->flags;
+	tcp_hdr_len = (uint16_t)((tcph->doff_res >> 4) * 4);
+
+	if (tcp_hdr_len < PB_TCP_HDR_LEN || ip_len < (size_t)ihl + tcp_hdr_len)
+		return;
+
+	payload     = (const uint8_t *)tcph + tcp_hdr_len;
+	payload_len = ip_len - ihl - tcp_hdr_len;
+
+	conn = tcp_conn_find(AF_INET, &iph->saddr, clt_port,
+	                     &iph->daddr, dst_port);
+
+	/* RST from client: tear down */
+	if (flags & PB_TH_RST) {
+		if (conn)
+			tcp_conn_remove(conn);
+		return;
+	}
+
+	/* New SYN: create connection entry and begin async connect */
+	if ((flags & PB_TH_SYN) && !(flags & PB_TH_ACK)) {
+		if (conn) {
+			/* Retransmitted SYN while still connecting: ignore */
+			return;
+		}
+
+		conn = tcp_conn_create(AF_INET, &iph->saddr, clt_port,
+		                       &iph->daddr, dst_port, peer);
+		if (!conn) return;
+
+		conn->clt_iss = seq;
+		conn->clt_seq = seq + 1;
+		/* Pick a cryptographically random ISN for the server side */
+		if (RAND_bytes((unsigned char *)&conn->srv_iss, sizeof(conn->srv_iss)) != 1)
+			conn->srv_iss = (uint32_t)(time(NULL) ^ (uintptr_t)conn);
+		conn->srv_seq = conn->srv_iss + 1; /* will be sent after SYN-ACK */
+
+		conn->fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (conn->fd < 0) {
+			tcp_conn_remove(conn);
+			return;
+		}
+		set_nonblock(conn->fd);
+
+		memset(&dst_addr, 0, sizeof(dst_addr));
+		dst_addr.sin_family      = AF_INET;
+		dst_addr.sin_addr.s_addr = iph->daddr;
+		dst_addr.sin_port        = htons(dst_port);
+
+		if (connect(conn->fd, (struct sockaddr *)&dst_addr,
+		            sizeof(dst_addr)) < 0 && errno != EINPROGRESS) {
+			tcp_conn_remove(conn);
+			return;
+		}
+		conn->state = TCP_CONNECTING;
+		return;
+	}
+
+	if (!conn)
+		return;
+
+	conn->last_active = time(NULL);
+
+	switch (conn->state) {
+
+	case TCP_CONNECTING:
+		/* Data or ACK before connect completes: ignore */
+		break;
+
+	case TCP_SYN_ACK_SENT:
+		/* Expect the ACK of our SYN-ACK */
+		if ((flags & PB_TH_ACK) && ntohl(tcph->ack_seq) == conn->srv_iss + 1) {
+			conn->state = TCP_ESTABLISHED;
+		}
+		/* Fall through: if there's also payload, process it */
+		if (!(flags & PB_TH_PSH) || payload_len == 0)
+			break;
+		/* FALLTHROUGH */
+
+	case TCP_ESTABLISHED:
+	case TCP_FIN_WAIT:
+		/* Forward payload to real server */
+		if (payload_len > 0) {
+			ssize_t n = send(conn->fd, payload, payload_len, 0);
+			if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+				/* Real server gone: send RST to client */
+				conn->srv_seq = ntohl(tcph->ack_seq);
+				tcp4_to_client(sockfd, conn,
+				               PB_TH_RST | PB_TH_ACK,
+				               NULL, 0, NULL, 0);
+				tcp_conn_remove(conn);
+				return;
+			}
+			if (n > 0) {
+				if ((size_t)n < payload_len) {
+					/* Partial write: out-of-sync, RST the connection */
+					conn->srv_seq = ntohl(tcph->ack_seq);
+					tcp4_to_client(sockfd, conn,
+					               PB_TH_RST | PB_TH_ACK,
+					               NULL, 0, NULL, 0);
+					tcp_conn_remove(conn);
+					return;
+				}
+				conn->clt_seq = seq + (uint32_t)payload_len;
+				/* Send ACK back to client */
+				tcp4_to_client(sockfd, conn,
+				               PB_TH_ACK,
+				               NULL, 0, NULL, 0);
+			}
+		}
+
+		/* Client closing */
+		if ((flags & PB_TH_FIN) && conn->state == TCP_ESTABLISHED) {
+			conn->clt_seq++;  /* FIN counts as one byte */
+			conn->state = TCP_FIN_WAIT;
+			shutdown(conn->fd, SHUT_WR);
+			/* ACK the FIN */
+			tcp4_to_client(sockfd, conn,
+			               PB_TH_ACK,
+			               NULL, 0, NULL, 0);
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+/* Process an incoming TCP packet from a VPN client (IPv6) */
+static void handle_client_tcp6(int sockfd,
+                                const struct pb_ip6hdr *ip6h, size_t ip_len,
+                                struct vpn_peer *peer)
+{
+	const struct pb_tcphdr *tcph;
+	uint16_t clt_port, dst_port;
+	uint16_t tcp_hdr_len;
+	uint32_t seq;
+	uint8_t flags;
+	const uint8_t *payload;
+	size_t payload_len;
+	struct tcp_conn *conn;
+	struct sockaddr_in6 dst_addr;
+
+	if (ip_len < PB_IPV6_HDR_LEN + PB_TCP_HDR_LEN)
+		return;
+
+	tcph        = (const struct pb_tcphdr *)((const uint8_t *)ip6h + PB_IPV6_HDR_LEN);
+	clt_port    = ntohs(tcph->sport);
+	dst_port    = ntohs(tcph->dport);
+	seq         = ntohl(tcph->seq);
+	flags       = tcph->flags;
+	tcp_hdr_len = (uint16_t)((tcph->doff_res >> 4) * 4);
+
+	if (tcp_hdr_len < PB_TCP_HDR_LEN || ip_len < PB_IPV6_HDR_LEN + tcp_hdr_len)
+		return;
+
+	payload     = (const uint8_t *)tcph + tcp_hdr_len;
+	payload_len = ip_len - PB_IPV6_HDR_LEN - tcp_hdr_len;
+
+	conn = tcp_conn_find(AF_INET6, ip6h->saddr, clt_port,
+	                     ip6h->daddr, dst_port);
+
+	if (flags & PB_TH_RST) {
+		if (conn) tcp_conn_remove(conn);
+		return;
+	}
+
+	if ((flags & PB_TH_SYN) && !(flags & PB_TH_ACK)) {
+		if (conn) return;
+
+		conn = tcp_conn_create(AF_INET6, ip6h->saddr, clt_port,
+		                       ip6h->daddr, dst_port, peer);
+		if (!conn) return;
+
+		conn->clt_iss = seq;
+		conn->clt_seq = seq + 1;
+		if (RAND_bytes((unsigned char *)&conn->srv_iss, sizeof(conn->srv_iss)) != 1)
+			conn->srv_iss = (uint32_t)(time(NULL) ^ (uintptr_t)conn);
+		conn->srv_seq = conn->srv_iss + 1;
+
+		conn->fd = socket(AF_INET6, SOCK_STREAM, 0);
+		if (conn->fd < 0) { tcp_conn_remove(conn); return; }
+		set_nonblock(conn->fd);
+
+		memset(&dst_addr, 0, sizeof(dst_addr));
+		dst_addr.sin6_family = AF_INET6;
+		memcpy(&dst_addr.sin6_addr, ip6h->daddr, 16);
+		dst_addr.sin6_port = htons(dst_port);
+
+		if (connect(conn->fd, (struct sockaddr *)&dst_addr,
+		            sizeof(dst_addr)) < 0 && errno != EINPROGRESS) {
+			tcp_conn_remove(conn); return;
+		}
+		conn->state = TCP_CONNECTING;
+		return;
+	}
+
+	if (!conn) return;
+	conn->last_active = time(NULL);
+
+	switch (conn->state) {
+	case TCP_CONNECTING:
+		break;
+
+	case TCP_SYN_ACK_SENT:
+		if ((flags & PB_TH_ACK) && ntohl(tcph->ack_seq) == conn->srv_iss + 1)
+			conn->state = TCP_ESTABLISHED;
+		if (!(flags & PB_TH_PSH) || payload_len == 0)
+			break;
+		/* FALLTHROUGH */
+
+	case TCP_ESTABLISHED:
+	case TCP_FIN_WAIT:
+		if (payload_len > 0) {
+			ssize_t n = send(conn->fd, payload, payload_len, 0);
+			if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+				conn->srv_seq = ntohl(tcph->ack_seq);
+				tcp6_to_client(sockfd, conn,
+				               PB_TH_RST | PB_TH_ACK,
+				               NULL, 0, NULL, 0);
+				tcp_conn_remove(conn);
+				return;
+			}
+			if (n > 0) {
+				if ((size_t)n < payload_len) {
+					conn->srv_seq = ntohl(tcph->ack_seq);
+					tcp6_to_client(sockfd, conn,
+					               PB_TH_RST | PB_TH_ACK,
+					               NULL, 0, NULL, 0);
+					tcp_conn_remove(conn);
+					return;
+				}
+				conn->clt_seq = seq + (uint32_t)payload_len;
+				tcp6_to_client(sockfd, conn,
+				               PB_TH_ACK, NULL, 0, NULL, 0);
+			}
+		}
+		if ((flags & PB_TH_FIN) && conn->state == TCP_ESTABLISHED) {
+			conn->clt_seq++;
+			conn->state = TCP_FIN_WAIT;
+			shutdown(conn->fd, SHUT_WR);
+			tcp6_to_client(sockfd, conn, PB_TH_ACK, NULL, 0, NULL, 0);
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+/* Called when a TCP NAT socket has an event */
+static void handle_tcp_nat_event(int sockfd, struct tcp_conn *conn,
+                                 short revents)
+{
+	/* Connect completion */
+	if (revents & POLLOUT) {
+		if (conn->state == TCP_CONNECTING) {
+			int err = 0;
+			socklen_t elen = sizeof(err);
+			getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+			if (err != 0) {
+				/* Connection refused / unreachable */
+				if (conn->af == AF_INET) {
+					uint8_t pkt[PB_MAX_PKT];
+					int len = pb_build_rst4(
+					    pkt, sizeof(pkt),
+					    conn->dst_ip4.s_addr, conn->clt_vip4.s_addr,
+					    conn->dst_port, conn->clt_port,
+					    conn->srv_iss, conn->clt_seq,
+					    PB_TH_RST | PB_TH_ACK);
+					if (len > 0)
+						send_inner_to_peer(sockfd, conn->peer,
+						                   ETH_P_IP, pkt, (size_t)len);
+				} else {
+					uint8_t pkt[PB_MAX_PKT];
+					int len = pb_build_rst6(
+					    pkt, sizeof(pkt),
+					    conn->dst_ip6.s6_addr, conn->clt_vip6.s6_addr,
+					    conn->dst_port, conn->clt_port,
+					    conn->srv_iss, conn->clt_seq,
+					    PB_TH_RST | PB_TH_ACK);
+					if (len > 0)
+						send_inner_to_peer(sockfd, conn->peer,
+						                   ETH_P_IPV6, pkt, (size_t)len);
+				}
+				tcp_conn_remove(conn);
+				return;
+			}
+
+			/* Connected: send SYN-ACK to client */
+			{
+				uint8_t mss_opt[4];
+				pb_make_mss_option(mss_opt, PB_TCP_MSS);
+
+				if (conn->af == AF_INET) {
+					tcp4_to_client(sockfd, conn,
+					               PB_TH_SYN | PB_TH_ACK,
+					               mss_opt, 4, NULL, 0);
+				} else {
+					tcp6_to_client(sockfd, conn,
+					               PB_TH_SYN | PB_TH_ACK,
+					               mss_opt, 4, NULL, 0);
+				}
+				/* srv_seq advances by 1 for the SYN */
+				/* (srv_seq was already set to srv_iss+1 at creation) */
+				conn->state = TCP_SYN_ACK_SENT;
+			}
+		}
+		return;
+	}
+
+	/* Incoming data or connection close from real server */
+	if (revents & (POLLIN | POLLHUP)) {
+		uint8_t buf[NM_PI_BUFFER_SIZE];
+		ssize_t n;
+
+		n = read(conn->fd, buf, sizeof(buf));
+
+		if (n <= 0) {
+			/* Real server closed or error: send FIN to client */
+			if (conn->af == AF_INET) {
+				tcp4_to_client(sockfd, conn,
+				               PB_TH_FIN | PB_TH_ACK,
+				               NULL, 0, NULL, 0);
+			} else {
+				tcp6_to_client(sockfd, conn,
+				               PB_TH_FIN | PB_TH_ACK,
+				               NULL, 0, NULL, 0);
+			}
+			tcp_conn_remove(conn);
+			return;
+		}
+
+		/* Forward data to client */
+		if (conn->af == AF_INET) {
+			tcp4_to_client(sockfd, conn,
+			               PB_TH_PSH | PB_TH_ACK,
+			               NULL, 0, buf, (size_t)n);
+		} else {
+			tcp6_to_client(sockfd, conn,
+			               PB_TH_PSH | PB_TH_ACK,
+			               NULL, 0, buf, (size_t)n);
+		}
+		conn->srv_seq += (uint32_t)n;
+		conn->last_active = time(NULL);
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * UDP NAT handlers
+ * ----------------------------------------------------------------------- */
+
+static void handle_client_udp4(int sockfd,
+                                const struct pb_iphdr *iph, size_t ip_len,
+                                struct vpn_peer *peer)
+{
+	uint8_t ihl = (iph->ihl_ver & 0x0f) * 4;
+	const struct pb_udphdr *udph;
+	uint16_t clt_port, dst_port;
+	const void *payload;
+	size_t payload_len;
+	struct udp_flow *flow;
+	struct sockaddr_in dst_addr;
+
+	if (ihl < PB_IPV4_HDR_LEN)
+		return;
+
+	if (ip_len < (size_t)ihl + PB_UDP_HDR_LEN)
+		return;
+
+	udph        = (const struct pb_udphdr *)((const uint8_t *)iph + ihl);
+	clt_port    = ntohs(udph->sport);
+	dst_port    = ntohs(udph->dport);
+	payload     = (const uint8_t *)udph + PB_UDP_HDR_LEN;
+	payload_len = ip_len - ihl - PB_UDP_HDR_LEN;
+
+	flow = udp_flow_find(AF_INET, &iph->saddr, clt_port,
+	                     &iph->daddr, dst_port);
+	if (!flow) {
+		flow = udp_flow_create(AF_INET, &iph->saddr, clt_port,
+		                       &iph->daddr, dst_port, peer);
+		if (!flow) return;
+
+		flow->fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (flow->fd < 0) { udp_flow_remove(flow); return; }
+		set_nonblock(flow->fd);
+
+		memset(&dst_addr, 0, sizeof(dst_addr));
+		dst_addr.sin_family      = AF_INET;
+		dst_addr.sin_addr.s_addr = iph->daddr;
+		dst_addr.sin_port        = htons(dst_port);
+		/* Connected socket: recv will get responses from this peer */
+		if (connect(flow->fd, (struct sockaddr *)&dst_addr,
+		            sizeof(dst_addr)) < 0) {
+			udp_flow_remove(flow);
+			return;
+		}
+	}
+
+	send(flow->fd, payload, payload_len, 0);
+	flow->last_active = time(NULL);
+	(void)sockfd;
+}
+
+static void handle_client_udp6(int sockfd,
+                                const struct pb_ip6hdr *ip6h, size_t ip_len,
+                                struct vpn_peer *peer)
+{
+	const struct pb_udphdr *udph;
+	uint16_t clt_port, dst_port;
+	const void *payload;
+	size_t payload_len;
+	struct udp_flow *flow;
+	struct sockaddr_in6 dst_addr;
+
+	if (ip_len < PB_IPV6_HDR_LEN + PB_UDP_HDR_LEN)
+		return;
+
+	udph        = (const struct pb_udphdr *)((const uint8_t *)ip6h + PB_IPV6_HDR_LEN);
+	clt_port    = ntohs(udph->sport);
+	dst_port    = ntohs(udph->dport);
+	payload     = (const uint8_t *)udph + PB_UDP_HDR_LEN;
+	payload_len = ip_len - PB_IPV6_HDR_LEN - PB_UDP_HDR_LEN;
+
+	flow = udp_flow_find(AF_INET6, ip6h->saddr, clt_port,
+	                     ip6h->daddr, dst_port);
+	if (!flow) {
+		flow = udp_flow_create(AF_INET6, ip6h->saddr, clt_port,
+		                       ip6h->daddr, dst_port, peer);
+		if (!flow) return;
+
+		flow->fd = socket(AF_INET6, SOCK_DGRAM, 0);
+		if (flow->fd < 0) { udp_flow_remove(flow); return; }
+		set_nonblock(flow->fd);
+
+		memset(&dst_addr, 0, sizeof(dst_addr));
+		dst_addr.sin6_family = AF_INET6;
+		memcpy(&dst_addr.sin6_addr, ip6h->daddr, 16);
+		dst_addr.sin6_port = htons(dst_port);
+		if (connect(flow->fd, (struct sockaddr *)&dst_addr,
+		            sizeof(dst_addr)) < 0) {
+			udp_flow_remove(flow); return;
+		}
+	}
+
+	send(flow->fd, payload, payload_len, 0);
+	flow->last_active = time(NULL);
+	(void)sockfd;
+}
+
+/* Called when a UDP NAT socket is readable */
+static void handle_udp_nat_event(int sockfd, struct udp_flow *flow)
+{
+	uint8_t buf[NM_PI_BUFFER_SIZE];
+	ssize_t n;
+	uint8_t pkt[PB_MAX_PKT];
+	int pkt_len;
+
+	n = recv(flow->fd, buf, sizeof(buf), 0);
+	if (n <= 0) return;
+
+	if (flow->af == AF_INET) {
+		pkt_len = pb_build_udp4(pkt, sizeof(pkt),
+		                        flow->dst_ip4.s_addr, flow->clt_vip4.s_addr,
+		                        flow->dst_port, flow->clt_port,
+		                        buf, (size_t)n);
+		if (pkt_len > 0)
+			send_inner_to_peer(sockfd, flow->peer,
+			                   ETH_P_IP, pkt, (size_t)pkt_len);
+	} else {
+		pkt_len = pb_build_udp6(pkt, sizeof(pkt),
+		                        flow->dst_ip6.s6_addr, flow->clt_vip6.s6_addr,
+		                        flow->dst_port, flow->clt_port,
+		                        buf, (size_t)n);
+		if (pkt_len > 0)
+			send_inner_to_peer(sockfd, flow->peer,
+			                   ETH_P_IPV6, pkt, (size_t)pkt_len);
+	}
+
+	flow->last_active = time(NULL);
+}
+
+/* -----------------------------------------------------------------------
+ * ICMP NAT handlers
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Create an ICMP socket for a flow.
+ * Try SOCK_DGRAM first (no root needed on Linux 3.x+); fall back to
+ * SOCK_RAW if it's not permitted.
+ * Returns the socket fd on success, or -1 on failure.
+ * *mapped_id is set to the ICMP ID the OS assigned to this socket.
+ */
+static int icmp_socket_create(int af, uint16_t *mapped_id, int *p_sock_type)
+{
+	int fd;
+	int proto = (af == AF_INET6) ? IPPROTO_ICMPV6 : IPPROTO_ICMP;
+
+	/* Try unprivileged SOCK_DGRAM first */
+	fd = socket(af, SOCK_DGRAM, proto);
+	if (fd >= 0) {
+		*p_sock_type = SOCK_DGRAM;
+	} else {
+		fd = socket(af, SOCK_RAW, proto);
+		if (fd >= 0)
+			*p_sock_type = SOCK_RAW;
+	}
+	if (fd < 0)
+		return -1;
+
+	set_nonblock(fd);
+
+	/* On SOCK_DGRAM ICMP the OS assigns the ID via the ephemeral port.
+	 * On SOCK_RAW we own the whole ICMP datagram and choose the ID
+	 * ourselves; for simplicity we still read back the local port
+	 * via getsockname as a unique ID generator. */
+	if (af == AF_INET) {
+		struct sockaddr_in sin;
+		socklen_t slen = sizeof(sin);
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family = AF_INET;
+		sin.sin_addr.s_addr = INADDR_ANY;
+		sin.sin_port = 0;
+		bind(fd, (struct sockaddr *)&sin, sizeof(sin));
+		slen = sizeof(sin);
+		getsockname(fd, (struct sockaddr *)&sin, &slen);
+		*mapped_id = ntohs(sin.sin_port);
+	} else {
+		struct sockaddr_in6 sin6;
+		socklen_t slen = sizeof(sin6);
+		memset(&sin6, 0, sizeof(sin6));
+		sin6.sin6_family = AF_INET6;
+		sin6.sin6_port = 0;
+		bind(fd, (struct sockaddr *)&sin6, sizeof(sin6));
+		slen = sizeof(sin6);
+		getsockname(fd, (struct sockaddr *)&sin6, &slen);
+		*mapped_id = ntohs(sin6.sin6_port);
+	}
+
+#ifdef __linux__
+	/* For ICMPv6 raw sockets, filter to only echo replies */
+	if (af == AF_INET6) {
+		struct icmp6_filter filt;
+		ICMP6_FILTER_SETBLOCKALL(&filt);
+		ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt);
+		setsockopt(fd, IPPROTO_ICMPV6, ICMP6_FILTER, &filt, sizeof(filt));
+	}
+#endif
+
+	return fd;
+}
+
+static void handle_client_icmp4(int sockfd,
+                                 const struct pb_iphdr *iph, size_t ip_len,
+                                 struct vpn_peer *peer)
+{
+	uint8_t ihl = (iph->ihl_ver & 0x0f) * 4;
+	const struct pb_icmphdr *icmph;
+	uint16_t orig_id, orig_seq;
+	struct icmp_flow *flow;
+	struct sockaddr_in dst_addr;
+	/* Buffer for ICMP header + data to send */
+	uint8_t icmp_buf[NM_PI_BUFFER_SIZE];
+	size_t icmp_data_len;
+
+	if (ihl < PB_IPV4_HDR_LEN)
+		return;
+
+	if (ip_len < (size_t)ihl + PB_ICMP_HDR_LEN)
+		return;
+
+	icmph = (const struct pb_icmphdr *)((const uint8_t *)iph + ihl);
+
+	/* Only handle echo requests */
+	if (icmph->type != PB_ICMP_ECHO_REQUEST)
+		return;
+
+	orig_id  = ntohs(icmph->id);
+	orig_seq = ntohs(icmph->seq);
+	icmp_data_len = ip_len - ihl - PB_ICMP_HDR_LEN;
+
+	/* Guard against stack overflow: icmp_buf is NM_PI_BUFFER_SIZE bytes */
+	if (icmp_data_len > sizeof(icmp_buf) - PB_ICMP_HDR_LEN)
+		return;
+
+	flow = icmp_flow_find(AF_INET, &iph->saddr, &iph->daddr, orig_id);
+	if (!flow) {
+		uint16_t mapped_id = 0;
+		int sock_type = SOCK_DGRAM;
+		int fd = icmp_socket_create(AF_INET, &mapped_id, &sock_type);
+		if (fd < 0) return;
+
+		flow = icmp_flow_create(AF_INET, &iph->saddr, &iph->daddr,
+		                        orig_id, peer);
+		if (!flow) { close(fd); return; }
+		flow->fd        = fd;
+		flow->mapped_id = mapped_id;
+		flow->sock_type = sock_type;
+	}
+
+	/* Rewrite the ICMP header with mapped_id */
+	memset(&icmp_buf, 0, PB_ICMP_HDR_LEN);
+	{
+		struct pb_icmphdr *out = (struct pb_icmphdr *)icmp_buf;
+		out->type  = PB_ICMP_ECHO_REQUEST;
+		out->code  = 0;
+		out->id    = htons(flow->mapped_id);
+		out->seq   = htons(orig_seq);
+		/* Copy ICMP data after the header */
+		if (icmp_data_len > 0)
+			memcpy(icmp_buf + PB_ICMP_HDR_LEN,
+			       (const uint8_t *)icmph + PB_ICMP_HDR_LEN,
+			       icmp_data_len);
+		out->check = 0;
+		out->check = pb_icmp_checksum(icmp_buf,
+		                              (int)(PB_ICMP_HDR_LEN + icmp_data_len));
+	}
+
+	memset(&dst_addr, 0, sizeof(dst_addr));
+	dst_addr.sin_family      = AF_INET;
+	dst_addr.sin_addr.s_addr = iph->daddr;
+	dst_addr.sin_port        = htons(flow->mapped_id); /* id for SOCK_DGRAM */
+
+	sendto(flow->fd, icmp_buf, PB_ICMP_HDR_LEN + icmp_data_len, 0,
+	       (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+	flow->last_active = time(NULL);
+	(void)sockfd;
+}
+
+static void handle_client_icmpv6(int sockfd,
+                                  const struct pb_ip6hdr *ip6h, size_t ip_len,
+                                  struct vpn_peer *peer)
+{
+	const struct pb_icmp6hdr *icmph;
+	uint16_t orig_id, orig_seq;
+	struct icmp_flow *flow;
+	struct sockaddr_in6 dst_addr;
+	uint8_t icmp_buf[NM_PI_BUFFER_SIZE];
+	size_t icmp_data_len;
+
+	if (ip_len < PB_IPV6_HDR_LEN + PB_ICMP_HDR_LEN)
+		return;
+
+	icmph = (const struct pb_icmp6hdr *)((const uint8_t *)ip6h + PB_IPV6_HDR_LEN);
+
+	if (icmph->type != PB_ICMPV6_ECHO_REQUEST)
+		return;
+
+	orig_id  = ntohs(icmph->id);
+	orig_seq = ntohs(icmph->seq);
+	icmp_data_len = ip_len - PB_IPV6_HDR_LEN - PB_ICMP_HDR_LEN;
+
+	/* Guard against stack overflow: icmp_buf is NM_PI_BUFFER_SIZE bytes */
+	if (icmp_data_len > sizeof(icmp_buf) - PB_ICMP_HDR_LEN)
+		return;
+
+	flow = icmp_flow_find(AF_INET6, ip6h->saddr, ip6h->daddr, orig_id);
+	if (!flow) {
+		uint16_t mapped_id = 0;
+		int sock_type = SOCK_DGRAM;
+		int fd = icmp_socket_create(AF_INET6, &mapped_id, &sock_type);
+		if (fd < 0) return;
+
+		flow = icmp_flow_create(AF_INET6, ip6h->saddr, ip6h->daddr,
+		                        orig_id, peer);
+		if (!flow) { close(fd); return; }
+		flow->fd        = fd;
+		flow->mapped_id = mapped_id;
+		flow->sock_type = sock_type;
+	}
+
+	{
+		struct pb_icmp6hdr *out = (struct pb_icmp6hdr *)icmp_buf;
+		out->type  = PB_ICMPV6_ECHO_REQUEST;
+		out->code  = 0;
+		out->id    = htons(flow->mapped_id);
+		out->seq   = htons(orig_seq);
+		if (icmp_data_len > 0)
+			memcpy(icmp_buf + PB_ICMP_HDR_LEN,
+			       (const uint8_t *)icmph + PB_ICMP_HDR_LEN,
+			       icmp_data_len);
+		out->check = 0;
+		out->check = pb_icmpv6_checksum(ip6h->saddr, ip6h->daddr,
+		                                icmp_buf,
+		                                (int)(PB_ICMP_HDR_LEN + icmp_data_len));
+	}
+
+	memset(&dst_addr, 0, sizeof(dst_addr));
+	dst_addr.sin6_family = AF_INET6;
+	memcpy(&dst_addr.sin6_addr, ip6h->daddr, 16);
+	dst_addr.sin6_port = htons(flow->mapped_id);
+
+	sendto(flow->fd, icmp_buf, PB_ICMP_HDR_LEN + icmp_data_len, 0,
+	       (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+	flow->last_active = time(NULL);
+	(void)sockfd;
+}
+
+/* Called when an ICMP NAT socket is readable */
+static void handle_icmp_nat_event(int sockfd, struct icmp_flow *flow)
+{
+	uint8_t buf[NM_PI_BUFFER_SIZE];
+	ssize_t n;
+	uint8_t pkt[PB_MAX_PKT];
+	int pkt_len;
+
+	n = recv(flow->fd, buf, sizeof(buf), 0);
+	if (n < (ssize_t)PB_ICMP_HDR_LEN)
+		return;
+
+	/* buf contains the ICMP/ICMPv6 header (id=mapped_id) + data.
+	 * SOCK_DGRAM: kernel strips the IP header; first byte is the ICMP type.
+	 * SOCK_RAW: kernel delivers the full IP packet; skip the IP header. */
+	{
+		const uint8_t *icmp_start = buf;
+		size_t icmp_total = (size_t)n;
+
+		if (flow->af == AF_INET && flow->sock_type == SOCK_RAW) {
+			uint8_t ihl = (buf[0] & 0x0f) * 4;
+			if (ihl < PB_IPV4_HDR_LEN || (size_t)n <= ihl)
+				return;
+			icmp_start = buf + ihl;
+			icmp_total = (size_t)n - ihl;
+		}
+
+		if (icmp_total < PB_ICMP_HDR_LEN)
+			return;
+
+		{
+			const struct pb_icmphdr *rep = (const struct pb_icmphdr *)icmp_start;
+
+			/* Validate that we received the expected reply type */
+			if (flow->af == AF_INET && rep->type != PB_ICMP_ECHO_REPLY)
+				return;
+			if (flow->af == AF_INET6 &&
+			    rep->type != (uint8_t)PB_ICMPV6_ECHO_REPLY)
+				return;
+
+			uint16_t rep_seq  = ntohs(rep->seq);
+			const void *data  = icmp_start + PB_ICMP_HDR_LEN;
+			size_t data_len   = icmp_total - PB_ICMP_HDR_LEN;
+
+			if (flow->af == AF_INET) {
+				pkt_len = pb_build_icmp4_reply(
+				    pkt, sizeof(pkt),
+				    flow->dst_ip4.s_addr, flow->clt_vip4.s_addr,
+				    flow->orig_id, rep_seq,
+				    data, data_len);
+				if (pkt_len > 0)
+					send_inner_to_peer(sockfd, flow->peer,
+					                   ETH_P_IP, pkt, (size_t)pkt_len);
+			} else {
+				pkt_len = pb_build_icmpv6_reply(
+				    pkt, sizeof(pkt),
+				    flow->dst_ip6.s6_addr, flow->clt_vip6.s6_addr,
+				    flow->orig_id, rep_seq,
+				    data, data_len);
+				if (pkt_len > 0)
+					send_inner_to_peer(sockfd, flow->peer,
+					                   ETH_P_IPV6, pkt, (size_t)pkt_len);
+			}
+		}
+	}
+
+	flow->last_active = time(NULL);
+}
+
+/* -----------------------------------------------------------------------
+ * Main VPN packet dispatcher
+ * ----------------------------------------------------------------------- */
+
+static void dispatch_ipv4(int sockfd, const uint8_t *pkt, size_t len,
+                           struct vpn_peer *peer)
+{
+	const struct pb_iphdr *iph = (const struct pb_iphdr *)pkt;
+	uint8_t ihl;
+	struct in_addr dst;
+
+	if (len < PB_IPV4_HDR_LEN)
+		return;
+
+	ihl = (iph->ihl_ver & 0x0f) * 4;
+	if (ihl < PB_IPV4_HDR_LEN || len < (size_t)ihl)
+		return;
+
+	dst.s_addr = iph->daddr;
+
+	/* Check for inter-client destination */
+	{
+		struct vpn_peer *dp = resolve_peer_ipv4(&dst);
+		if (dp && dp != peer) {
+			forward_to_peer(sockfd, dp, ETH_P_IP, pkt, len);
+			return;
+		}
+	}
+
+	/* External NAT */
+	switch (iph->protocol) {
+	case IPPROTO_TCP:
+		handle_client_tcp4(sockfd, iph, len, peer);
+		break;
+	case IPPROTO_UDP:
+		handle_client_udp4(sockfd, iph, len, peer);
+		break;
+	case IPPROTO_ICMP:
+		handle_client_icmp4(sockfd, iph, len, peer);
+		break;
+	default:
+		break;
+	}
+}
+
+static void dispatch_ipv6(int sockfd, const uint8_t *pkt, size_t len,
+                           struct vpn_peer *peer)
+{
+	const struct pb_ip6hdr *ip6h = (const struct pb_ip6hdr *)pkt;
+	struct in6_addr dst;
+
+	if (len < PB_IPV6_HDR_LEN)
+		return;
+
+	memcpy(&dst, ip6h->daddr, 16);
+
+	{
+		struct vpn_peer *dp = resolve_peer_ipv6(&dst);
+		if (dp && dp != peer) {
+			forward_to_peer(sockfd, dp, ETH_P_IPV6, pkt, len);
+			return;
+		}
+	}
+
+	switch (ip6h->nexthdr) {
+	case IPPROTO_TCP:
+		handle_client_tcp6(sockfd, ip6h, len, peer);
+		break;
+	case IPPROTO_UDP:
+		handle_client_udp6(sockfd, ip6h, len, peer);
+		break;
+	case IPPROTO_ICMPV6:
+		handle_client_icmpv6(sockfd, ip6h, len, peer);
+		break;
+	default:
+		break;
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * Receive one VPN UDP packet
+ * ----------------------------------------------------------------------- */
+
+static void network_receiving(int sockfd)
+{
+	char read_buf[NM_CRYPTO_BUF_SIZE], crypt_buf[NM_CRYPTO_BUF_SIZE];
+	struct minivtun_msg *nmsg;
+	struct sockaddr_storage real_peer;
+	socklen_t real_peer_len = sizeof(real_peer);
+	void *out_data;
+	size_t out_dlen;
+	int rc;
+	unsigned short af;
+	struct vpn_peer *peer;
+
+	rc = (int)recvfrom(sockfd, read_buf, sizeof(read_buf), 0,
+	                   (struct sockaddr *)&real_peer, &real_peer_len);
+	if (rc <= 0)
+		return;
+
+	out_data = crypt_buf;
 	out_dlen = (size_t)rc;
-	netmsg_to_local(read_buffer, &out_data, &out_dlen);
+	netmsg_to_local(read_buf, &out_data, &out_dlen);
 	nmsg = out_data;
 
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
-		return 0;
- 
- #if DEBUG
-    dump_nmsg(nmsg);
- #endif
+		return;
 
-	/* Verify password. */
 	if (memcmp(nmsg->hdr.auth_key, config.crypto_key,
-		sizeof(nmsg->hdr.auth_key)) != 0)
-		return 0;
+	           sizeof(nmsg->hdr.auth_key)) != 0)
+		return;
 
 	switch (nmsg->hdr.opcode) {
 
-		// Keepalive packet
-	case MINIVTUN_MSG_KEEPALIVE:
-		if ((re = ra_get_or_create(&real_peer))) {
-			re->last_recv = current_ts;
-			ra_put_no_free(re);
-		}
+	case MINIVTUN_MSG_KEEPALIVE: {
+		/* Copy out of packed struct to avoid unaligned pointer warnings */
+		struct in_addr ka_in4;
+		struct in6_addr ka_in6;
 		if (out_dlen < MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive))
-			return 0;
-		if (is_valid_unicast_in(&nmsg->keepalive.loc_tun_in)) {
-			virt_addr.af = AF_INET;
-			virt_addr.in = nmsg->keepalive.loc_tun_in;
-			if ((ce = tun_client_get_or_create(&virt_addr, &real_peer)))
-				ce->last_recv = current_ts;
+			break;
+		memcpy(&ka_in4, &nmsg->keepalive.loc_tun_in,  sizeof(ka_in4));
+		memcpy(&ka_in6, &nmsg->keepalive.loc_tun_in6, sizeof(ka_in6));
+		if (is_valid_unicast_in(&ka_in4)) {
+			peer = peer_get_or_create(AF_INET, &ka_in4, &real_peer);
+			if (peer) peer->last_active = time(NULL);
 		}
-		if (is_valid_unicast_in6(&nmsg->keepalive.loc_tun_in6)) {
-			virt_addr.af = AF_INET6;
-			virt_addr.in6 = nmsg->keepalive.loc_tun_in6;
-			if ((ce = tun_client_get_or_create(&virt_addr, &real_peer)))
-				ce->last_recv = current_ts;
+		if (is_valid_unicast_in6(&ka_in6)) {
+			peer = peer_get_or_create(AF_INET6, &ka_in6, &real_peer);
+			if (peer) peer->last_active = time(NULL);
 		}
 		break;
+	}
 
-		// data packet
-	case MINIVTUN_MSG_IPDATA:
+	case MINIVTUN_MSG_IPDATA: {
+		size_t ip_dlen;
+		const uint8_t *ip_pkt;
+
 		if (nmsg->ipdata.proto == htons(ETH_P_IP)) {
 			af = AF_INET;
-			/* No packet is shorter than a 20-byte IPv4 header. */
 			if (out_dlen < MINIVTUN_MSG_IPDATA_OFFSET + 20)
-				return 0;
+				break;
 		} else if (nmsg->ipdata.proto == htons(ETH_P_IPV6)) {
 			af = AF_INET6;
 			if (out_dlen < MINIVTUN_MSG_IPDATA_OFFSET + 40)
-				return 0;
+				break;
 		} else {
-			fprintf(stderr, "*** Invalid protocol: 0x%x.\n", ntohs(nmsg->ipdata.proto));
-			return 0;
+			break;
 		}
 
 		ip_dlen = ntohs(nmsg->ipdata.ip_dlen);
-		/* Drop incomplete IP packets. */
 		if (out_dlen - MINIVTUN_MSG_IPDATA_OFFSET < ip_dlen)
-			return 0;
+			break;
 
-		source_addr_of_ipdata(nmsg->ipdata.data, af, &virt_addr);
-		if ((ce = tun_client_get_or_create(&virt_addr, &real_peer)) == NULL)
-			return 0;
+		ip_pkt = (const uint8_t *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
 
-		ce->last_recv = current_ts;
-		ce->ra->last_recv = current_ts;
+		/* Identify / update the sending peer */
+		if (af == AF_INET) {
+			/* Source IP is at offset 12 in IPv4 header */
+			struct in_addr src;
+			memcpy(&src, ip_pkt + 12, 4);
+			peer = peer_get_or_create(AF_INET, &src, &real_peer);
+		} else {
+			/* Source IP is at offset 8 in IPv6 header */
+			struct in6_addr src;
+			memcpy(&src, ip_pkt + 8, 16);
+			peer = peer_get_or_create(AF_INET6, &src, &real_peer);
+		}
+		if (!peer)
+			break;
 
-		//pi.flags = 0;
-		// pi.proto = nmsg->ipdata.proto;
-		//osx_ether_to_af(&pi.proto);
-		set_pi_with_ether_proto(&pi, ntohs(nmsg->ipdata.proto));
-		iov[0].iov_base = &pi;
-		iov[0].iov_len = sizeof(pi);
-		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
-		iov[1].iov_len = ip_dlen;
-		rc = (int)writev(tunfd, iov, 2);
+		peer->last_active = time(NULL);
 
-#ifdef DEBUG
-        printf("Write to tun: ");
-		hexdump(iov[0].iov_base, iov[0].iov_len);
-		hexdump(iov[1].iov_base, iov[1].iov_len);
-#endif
-
+		if (af == AF_INET)
+			dispatch_ipv4(sockfd, ip_pkt, ip_dlen, peer);
+		else
+			dispatch_ipv6(sockfd, ip_pkt, ip_dlen, peer);
 		break;
 	}
 
-	return 0;
+	default:
+		break;
+	}
 }
 
-// When sth. readable from tun interface.
-static int tunnel_receiving(int tunfd, int sockfd)
+/* -----------------------------------------------------------------------
+ * Main server entry point
+ * ----------------------------------------------------------------------- */
+
+int run_server(const char *loc_addr_pair)
 {
-	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
-	struct tun_pi *pi = (void *)read_buffer;
-	struct minivtun_msg nmsg;
-	void *out_data;
-	size_t ip_dlen, out_dlen;
-	unsigned short af = 0;
-	struct tun_addr virt_addr;
-	struct tun_client *ce;
-	int rc;
-
-	rc = (int)read(tunfd, pi, NM_PI_BUFFER_SIZE);
-#if DEBUG	
-	if ( rc < 0 ) {
-	   perror("read");
-	   abort();
-	}
-
-    printf("tunnel_receiving:\n");
-	hexdump(read_buffer, rc);
-#endif
-
-	if (rc < sizeof(struct tun_pi))
-		return 0;
-
-	// osx_af_to_ether(&pi->proto);
-
-	ip_dlen = (size_t)rc - sizeof(struct tun_pi);
-
-	/* We only accept IPv4 or IPv6 frames. */
-	/*
-	if (pi->proto == htons(ETH_P_IP)) {
-		af = AF_INET;
-		if (ip_dlen < 20)
-			return 0;
-	} else if (pi->proto == htons(ETH_P_IPV6)) {
-		af = AF_INET6;
-		if (ip_dlen < 40)
-			return 0;
-	} else {
-		fprintf(stderr, "*** Invalid protocol: 0x%x.\n", ntohs(pi->proto));
-		return 0;
-	}
-	*/
-	af = get_family_from_pi(pi);
-
-	if ( af == AF_INET ) {
-	   if ( ip_dlen < 20 )
-	      return 0;
-	}
-	else if ( af == AF_INET6 ) {
-	   if ( ip_dlen < 40 )
-	      return 0;
-	}
-	else {   
-		fprintf(stderr, "*** Invalid protocol: 0x%x.\n", get_ether_proto_from_pi(pi));
-		return 0;
-	}
-
-	dest_addr_of_ipdata(pi + 1, af, &virt_addr);
-
-	if ((ce = tun_client_try_get(&virt_addr)) == NULL) {
-		/**
-		 * Not an existing client address, lookup the pseudo
-		 * route table for a destination to send.
-		 */
-		if (virt_addr.af == AF_INET) {
-			struct in_addr *gw;
-			struct tun_addr __virt_addr;
-
-			/* Lookup the gateway virtual address first. */
-			if ((gw = vt_route_lookup(&virt_addr.in)) == NULL)
-				return 0;
-
-			/* Then get the gateway client entry. */
-			memset(&__virt_addr, 0x0, sizeof(__virt_addr));
-			__virt_addr.af = AF_INET;
-			__virt_addr.in = *gw;
-			if ((ce = tun_client_try_get(&__virt_addr)) == NULL)
-				return 0;
-
-			/* Finally, create the client entry. */
-			if ((ce = tun_client_get_or_create(&virt_addr,
-				&ce->ra->real_addr)) == NULL)
-				return 0;
-		} else {
-			return 0;
-		}
-	}
-
-	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
-	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
-	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
-	nmsg.ipdata.proto = htons(get_ether_proto_from_pi(pi)); // pi->proto;
-	nmsg.ipdata.ip_dlen = htons(ip_dlen);
-	memcpy(nmsg.ipdata.data, pi + 1, ip_dlen);
-
-	/* Do encryption. */
-	out_data = crypt_buffer;
-	out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
-	local_to_netmsg(&nmsg, &out_data, &out_dlen);
-
-#if DEBUG
-    dump_nmsg(&nmsg);
-
-	printf("out data:\n");
-	hexdump(out_data, out_dlen);
-#endif	
-
-	rc = (int)sendto(sockfd, out_data, out_dlen, 0,
-				(struct sockaddr *)&ce->ra->real_addr,
-				sizeof_sockaddr(&ce->ra->real_addr));
-	ce->last_xmit = current_ts;
-	ce->ra->last_xmit = current_ts;
-
-	return 0;
-}
-
-int run_server(int tunfd, const char *loc_addr_pair)
-{
-	struct timeval timeo;
-	int sockfd, rc;
 	struct sockaddr_inx loc_addr;
-	fd_set rset;
-	time_t last_walk;
+	int sockfd;
 	char s_loc_addr[50];
+	time_t last_walk;
+	static struct pollfd pfds[MAX_POLL_FDS];
 
 	if (get_sockaddr_inx_pair(loc_addr_pair, &loc_addr) < 0) {
 		fprintf(stderr, "*** Cannot resolve address pair '%s'.\n", loc_addr_pair);
 		return -1;
 	}
 
-	inet_ntop(loc_addr.sa.sa_family, addr_of_sockaddr(&loc_addr), s_loc_addr,
-			  sizeof(s_loc_addr));
-	printf("Mini virtual tunnelling server on %s:%u, interface: %s.\n",
-			s_loc_addr, ntohs(port_of_sockaddr(&loc_addr)), config.devname);
+	inet_ntop(loc_addr.sa.sa_family, addr_of_sockaddr(&loc_addr),
+	          s_loc_addr, sizeof(s_loc_addr));
+	printf("Userspace NAT server on %s:%u\n",
+	       s_loc_addr, ntohs(port_of_sockaddr(&loc_addr)));
 
-	/* Initialize address map hash table. */
-	init_va_ra_maps();
-	hash_initval = (uint32_t)time(NULL);
+	natmap_init();
 
-	if ((sockfd = socket(loc_addr.sa.sa_family, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
-		fprintf(stderr, "*** socket() failed: %s.\n", strerror(errno));
-		exit(1);
+	sockfd = socket(loc_addr.sa.sa_family, SOCK_DGRAM, IPPROTO_UDP);
+	if (sockfd < 0) {
+		fprintf(stderr, "*** socket(): %s\n", strerror(errno));
+		return -1;
 	}
-	if (bind(sockfd, (struct sockaddr *)&loc_addr, sizeof_sockaddr(&loc_addr)) < 0) {
-		fprintf(stderr, "*** bind() failed: %s.\n", strerror(errno));
-		exit(1);
+	if (bind(sockfd, (struct sockaddr *)&loc_addr,
+	         sizeof_sockaddr(&loc_addr)) < 0) {
+		fprintf(stderr, "*** bind(): %s\n", strerror(errno));
+		close(sockfd);
+		return -1;
 	}
 	set_nonblock(sockfd);
 
-	/* Run in background. */
 	if (config.in_background)
 		do_daemonize();
 	if (config.pid_file) {
-		FILE *fp;
-		if ((fp = fopen(config.pid_file, "w"))) {
-			fprintf(fp, "%d\n", (int)getpid());
-			fclose(fp);
-		}
+		FILE *fp = fopen(config.pid_file, "w");
+		if (fp) { fprintf(fp, "%d\n", (int)getpid()); fclose(fp); }
 	}
 
 	last_walk = time(NULL);
 
 	for (;;) {
-		FD_ZERO(&rset);
-		FD_SET(tunfd, &rset);
-		FD_SET(sockfd, &rset);
+		int nfds, nat_fds, rc, i;
+		time_t now;
 
-		timeo.tv_sec = 2;
-		timeo.tv_usec = 0;
+		/* [0] always the VPN UDP socket */
+		pfds[0].fd      = sockfd;
+		pfds[0].events  = POLLIN;
+		pfds[0].revents = 0;
 
-		rc = select((tunfd > sockfd ? tunfd : sockfd) + 1, &rset, NULL, NULL, &timeo);
-		if (rc < 0) {
-			fprintf(stderr, "*** select(): %s.\n", strerror(errno));
-			return -1;
+		nat_fds = natmap_build_pollfd(pfds + 1, MAX_POLL_FDS - 1);
+		if (nat_fds < 0) nat_fds = 0;
+		nfds = 1 + nat_fds;
+
+		rc = poll(pfds, (nfds_t)nfds, 2000);
+		if (rc < 0 && errno != EINTR) {
+			fprintf(stderr, "*** poll(): %s\n", strerror(errno));
+			break;
 		}
 
-		current_ts = time(NULL);
+		now = time(NULL);
 
 		if (rc > 0) {
-			if (FD_ISSET(sockfd, &rset)) {
-				rc = network_receiving(tunfd, sockfd);
-			}
+			if (pfds[0].revents & POLLIN)
+				network_receiving(sockfd);
 
-			if (FD_ISSET(tunfd, &rset)) {
-				rc = tunnel_receiving(tunfd, sockfd);
+			for (i = 1; i < nfds; i++) {
+				short rev = pfds[i].revents;
+				if (!rev) continue;
+				int fd = pfds[i].fd;
+
+				/* Identify NAT entry by fd */
+				{
+					struct tcp_conn *tc = tcp_conn_find_by_fd(fd);
+					if (tc) {
+						handle_tcp_nat_event(sockfd, tc, rev);
+						continue;
+					}
+				}
+				{
+					struct udp_flow *uf = udp_flow_find_by_fd(fd);
+					if (uf) {
+						handle_udp_nat_event(sockfd, uf);
+						continue;
+					}
+				}
+				{
+					struct icmp_flow *ic = icmp_flow_find_by_fd(fd);
+					if (ic) {
+						handle_icmp_nat_event(sockfd, ic);
+						continue;
+					}
+				}
 			}
 		}
 
-		/* Check connection state at each chance. */
-		if (current_ts - last_walk >= 3) {
-			va_ra_walk_continue(sockfd);
-			last_walk = current_ts;
+		if (now - last_walk >= 5) {
+			natmap_expire(now);
+			peer_walk(sockfd, now, config.keepalive_timeo,
+			          config.reconnect_timeo);
+			last_walk = now;
 		}
 	}
 
+	close(sockfd);
 	return 0;
 }

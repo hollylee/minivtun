@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <errno.h>
+#include <ctype.h>
 #include <time.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -246,7 +247,7 @@ int main(int argc, char *argv[])
 	const char *tun_ip_config = NULL, *tun_ip6_config = NULL;
 	const char *loc_addr_pair = NULL, *peer_addr_pair = NULL;
 	const char *crypto_type = CRYPTO_DEFAULT_ALGORITHM;
-	char cmd[128];
+	char cmd[256];
 	int tunfd, opt;
 
 	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:b:dwhf",
@@ -311,130 +312,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
-    // This is for Linux only. In OS X, config.devname would be overwritten to "utun%d" in tun_alloc()
-	if (strlen(config.devname) == 0)
-		strcpy(config.devname, "mv%d");
-
-	if ((tunfd = tun_alloc(config.devname)) < 0) {
-		fprintf(stderr, "*** open_tun() failed: %s.\n", strerror(errno));
-		exit(1);
-	}
-
-	/* Configure IPv4 address for the interface. */
-	if (tun_ip_config) {
-
-		char s_lip[20], s_rip[20], *sp;
-		struct in_addr vaddr;
-		int pfxlen = 0;
-
-        // client needs to determine binding ip address
-		if ( peer_addr_pair ) {
-		   if ( validate_and_setup_bind_addr(config.bind_to_addr, sizeof(config.bind_to_addr),
-		                                     config.bind_if, sizeof(config.bind_if)) < 0 ) {
-			  fprintf(stderr, "Invalid bind_to_addr address: %s, multiple default routes, or cannot get bound address from default route.\n", config.bind_to_addr);
-			  exit(1);
-		   }
-		}
-
-        // Get local ip address
-		if (!(sp = strchr(tun_ip_config, '/'))) {
-			fprintf(stderr, "*** Invalid IPv4 address pair: %s.\n", tun_ip_config);
-			exit(1);
-		}
-		strncpy(s_lip, tun_ip_config, sp - tun_ip_config);
-		s_lip[sp - tun_ip_config] = '\0';
-		sp++;
-		strncpy(s_rip, sp, sizeof(s_rip));
-		s_rip[sizeof(s_rip) - 1] = '\0';
-
-		if (!inet_pton(AF_INET, s_lip, &vaddr)) {
-			fprintf(stderr, "*** Invalid local IPv4 address: %s.\n", s_lip);
-			exit(1);
-		}
-		config.local_tun_in = vaddr;
-
-		// If it is local_ip/remote_ip format of -r option
-		if (inet_pton(AF_INET, s_rip, &vaddr)) {
-			struct in_addr __network = { .s_addr = 0 };
-#ifdef __APPLE__
-			sprintf(cmd, "ifconfig %s %s %s", config.devname, s_lip, s_rip);
-#else
-			sprintf(cmd, "ifconfig %s %s pointopoint %s", config.devname, s_lip, s_rip);
-#endif
-			vt_route_add(&__network, 0, &vaddr);
-		} 
-		// If it is local_ip/prefix format of -r option
-		else if (sscanf(s_rip, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen < 31 ) {
-			uint32_t mask = ~((1 << (32 - pfxlen)) - 1);
-#ifdef __APPLE__
-			uint32_t network = ntohl(vaddr.s_addr) & mask;
-			sprintf(s_rip, "%u.%u.%u.%u", network >> 24, (network >> 16) & 0xff,
-					(network >> 8) & 0xff, network & 0xff);
-			sprintf(cmd, "ifconfig %s %s %s && route add -net %s/%d %s >/dev/null",
-					config.devname, s_lip, s_lip, s_rip, pfxlen, s_lip);
-#else
-			sprintf(s_rip, "%u.%u.%u.%u", mask >> 24, (mask >> 16) & 0xff,
-					(mask >> 8) & 0xff, mask & 0xff);
-			sprintf(cmd, "ifconfig %s %s netmask %s", config.devname, s_lip, s_rip);
-#endif
-		} 
-		else {
-			fprintf(stderr, "*** Not a legal netmask or prefix length: %s.\n",
-					s_rip);
-			exit(1);
-		}
-
-		// Run ifconfig
-		(void)system(cmd);
-
-		// Invoking route command to add default if config.send_all_traffic
-		if ( config.send_all_traffic ) {
-#ifdef __APPLE__
-           // 1. Add a ifscoped default route for current default
-#else
-           // TODO:
-#endif			
-		}
-	}
-
-	/* Configure IPv6 address if set. */
-	if (tun_ip6_config) {
-		char s_lip[50], s_pfx[20], *sp;
-		struct in6_addr vaddr;
-		int pfxlen = 0;
-
-		if (!(sp = strchr(tun_ip6_config, '/'))) {
-			fprintf(stderr, "*** Invalid IPv6 address pair: %s.\n", tun_ip6_config);
-			exit(1);
-		}
-		strncpy(s_lip, tun_ip6_config, sp - tun_ip6_config);
-		s_lip[sp - tun_ip6_config] = '\0';
-		sp++;
-		strncpy(s_pfx, sp, sizeof(s_pfx));
-		s_pfx[sizeof(s_pfx) - 1] = '\0';
-
-		if (!inet_pton(AF_INET6, s_lip, &vaddr)) {
-			fprintf(stderr, "*** Invalid local IPv6 address: %s.\n", s_lip);
-			exit(1);
-		}
-		config.local_tun_in6 = vaddr;
-		if (!(sscanf(s_pfx, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen <= 128)) {
-			fprintf(stderr, "*** Not a legal prefix length: %s.\n", s_pfx);
-			exit(1);
-		}
-
-#ifdef __APPLE__
-		sprintf(cmd, "ifconfig %s inet6 %s/%d", config.devname, s_lip, pfxlen);
-#else
-		sprintf(cmd, "ifconfig %s add %s/%d", config.devname, s_lip, pfxlen);
-#endif
-		(void)system(cmd);
-	}
-
-	/* Always bring it up with proper MTU size. */
-	sprintf(cmd, "ifconfig %s mtu %u; ifconfig %s up", config.devname, config.tun_mtu, config.devname);
-	(void)system(cmd);
-
 	if (enabled_encryption()) {
 		fill_with_string_md5sum(config.crypto_passwd, config.crypto_key, CRYPTO_MAX_KEY_SIZE);
 		if ((config.crypto_type = get_crypto_type(crypto_type)) == NULL) {
@@ -447,8 +324,173 @@ int main(int argc, char *argv[])
 	}
 
 	if (loc_addr_pair) {
-		run_server(tunfd, loc_addr_pair);
+		/*
+		 * Server mode: userspace NAT -- no TUN interface needed.
+		 * Parse -a/-A only to record local_tun_in[6] used in keepalives.
+		 */
+		if (tun_ip_config) {
+			char s_lip[20]; const char *sp;
+			struct in_addr vaddr;
+			if ((sp = strchr(tun_ip_config, '/')) != NULL) {
+				size_t lip_len = (size_t)(sp - tun_ip_config);
+				if (lip_len >= sizeof(s_lip)) {
+					fprintf(stderr, "*** IPv4 address too long: %s.\n", tun_ip_config);
+					exit(1);
+				}
+				memcpy(s_lip, tun_ip_config, lip_len);
+				s_lip[lip_len] = '\0';
+				inet_pton(AF_INET, s_lip, &vaddr);
+				config.local_tun_in = vaddr;
+			}
+		}
+		if (tun_ip6_config) {
+			char s_lip[50]; const char *sp;
+			struct in6_addr vaddr;
+			if ((sp = strchr(tun_ip6_config, '/')) != NULL) {
+				size_t lip_len = (size_t)(sp - tun_ip6_config);
+				if (lip_len >= sizeof(s_lip)) {
+					fprintf(stderr, "*** IPv6 address too long: %s.\n", tun_ip6_config);
+					exit(1);
+				}
+				memcpy(s_lip, tun_ip6_config, lip_len);
+				s_lip[lip_len] = '\0';
+				inet_pton(AF_INET6, s_lip, &vaddr);
+				config.local_tun_in6 = vaddr;
+			}
+		}
+		run_server(loc_addr_pair);
 	} else if (peer_addr_pair) {
+		/*
+		 * Client mode: allocate TUN and configure it.
+		 */
+		if (strlen(config.devname) == 0)
+			strcpy(config.devname, "mv%d");
+
+		if ((tunfd = tun_alloc(config.devname)) < 0) {
+			fprintf(stderr, "*** open_tun() failed: %s.\n", strerror(errno));
+			exit(1);
+		}
+
+		/* Reject devnames with shell metacharacters before any system() call */
+		{
+			const char *p = config.devname;
+			for (; *p; p++) {
+				if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') {
+					fprintf(stderr, "*** Unsafe interface name: %s\n",
+					        config.devname);
+					exit(1);
+				}
+			}
+		}
+
+		if (tun_ip_config) {
+			char s_lip[20], s_rip[20], *sp;
+			struct in_addr vaddr;
+			int pfxlen = 0;
+
+			if (validate_and_setup_bind_addr(config.bind_to_addr,
+			                                 sizeof(config.bind_to_addr),
+			                                 config.bind_if,
+			                                 sizeof(config.bind_if)) < 0) {
+				fprintf(stderr, "Invalid bind_to_addr address: %s\n",
+				        config.bind_to_addr);
+				exit(1);
+			}
+
+			if (!(sp = strchr(tun_ip_config, '/'))) {
+				fprintf(stderr, "*** Invalid IPv4 address pair: %s.\n", tun_ip_config);
+				exit(1);
+			}
+			{
+				size_t lip_len = (size_t)(sp - tun_ip_config);
+				if (lip_len >= sizeof(s_lip)) {
+					fprintf(stderr, "*** IPv4 address too long: %s.\n", tun_ip_config);
+					exit(1);
+				}
+				memcpy(s_lip, tun_ip_config, lip_len);
+				s_lip[lip_len] = '\0';
+			}
+			sp++;
+			strncpy(s_rip, sp, sizeof(s_rip));
+			s_rip[sizeof(s_rip) - 1] = '\0';
+
+			if (!inet_pton(AF_INET, s_lip, &vaddr)) {
+				fprintf(stderr, "*** Invalid local IPv4 address: %s.\n", s_lip);
+				exit(1);
+			}
+			config.local_tun_in = vaddr;
+
+			if (inet_pton(AF_INET, s_rip, &vaddr)) {
+				struct in_addr __network = { .s_addr = 0 };
+#ifdef __APPLE__
+				snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s", config.devname, s_lip, s_rip);
+#else
+				snprintf(cmd, sizeof(cmd), "ifconfig %s %s pointopoint %s", config.devname, s_lip, s_rip);
+#endif
+				vt_route_add(&__network, 0, &vaddr);
+			} else if (sscanf(s_rip, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen < 31) {
+				uint32_t mask = ~((1 << (32 - pfxlen)) - 1);
+#ifdef __APPLE__
+				uint32_t network = ntohl(vaddr.s_addr) & mask;
+				snprintf(s_rip, sizeof(s_rip), "%u.%u.%u.%u", network >> 24, (network >> 16) & 0xff,
+				        (network >> 8) & 0xff, network & 0xff);
+				snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s && route add -net %s/%d %s >/dev/null",
+				        config.devname, s_lip, s_lip, s_rip, pfxlen, s_lip);
+#else
+				snprintf(s_rip, sizeof(s_rip), "%u.%u.%u.%u", mask >> 24, (mask >> 16) & 0xff,
+				        (mask >> 8) & 0xff, mask & 0xff);
+				snprintf(cmd, sizeof(cmd), "ifconfig %s %s netmask %s", config.devname, s_lip, s_rip);
+#endif
+			} else {
+				fprintf(stderr, "*** Not a legal netmask or prefix length: %s.\n", s_rip);
+				exit(1);
+			}
+			(void)system(cmd);
+		}
+
+		if (tun_ip6_config) {
+			char s_lip[50], s_pfx[20], *sp;
+			struct in6_addr vaddr;
+			int pfxlen = 0;
+
+			if (!(sp = strchr(tun_ip6_config, '/'))) {
+				fprintf(stderr, "*** Invalid IPv6 address pair: %s.\n", tun_ip6_config);
+				exit(1);
+			}
+			{
+				size_t lip_len = (size_t)(sp - tun_ip6_config);
+				if (lip_len >= sizeof(s_lip)) {
+					fprintf(stderr, "*** IPv6 address too long: %s.\n", tun_ip6_config);
+					exit(1);
+				}
+				memcpy(s_lip, tun_ip6_config, lip_len);
+				s_lip[lip_len] = '\0';
+			}
+			sp++;
+			strncpy(s_pfx, sp, sizeof(s_pfx));
+			s_pfx[sizeof(s_pfx) - 1] = '\0';
+
+			if (!inet_pton(AF_INET6, s_lip, &vaddr)) {
+				fprintf(stderr, "*** Invalid local IPv6 address: %s.\n", s_lip);
+				exit(1);
+			}
+			config.local_tun_in6 = vaddr;
+			if (!(sscanf(s_pfx, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen <= 128)) {
+				fprintf(stderr, "*** Not a legal prefix length: %s.\n", s_pfx);
+				exit(1);
+			}
+#ifdef __APPLE__
+			snprintf(cmd, sizeof(cmd), "ifconfig %s inet6 %s/%d", config.devname, s_lip, pfxlen);
+#else
+			snprintf(cmd, sizeof(cmd), "ifconfig %s add %s/%d", config.devname, s_lip, pfxlen);
+#endif
+			(void)system(cmd);
+		}
+
+		snprintf(cmd, sizeof(cmd), "ifconfig %s mtu %u; ifconfig %s up",
+		         config.devname, config.tun_mtu, config.devname);
+		(void)system(cmd);
+
 		run_client(tunfd, peer_addr_pair);
 	} else {
 		fprintf(stderr, "*** No valid local or peer address specified.\n");
@@ -467,6 +509,7 @@ void set_config_params(const char * crypto_key)
 {
 	 // strncpy(config.crypto_passwd, crypto_key, CRYPTO_MAX_KEY_SIZE);
      config.crypto_passwd = strdup(crypto_key);
+	 if (!config.crypto_passwd) return;  /* OOM guard */
 	 fill_with_string_md5sum(config.crypto_passwd, config.crypto_key, CRYPTO_MAX_KEY_SIZE);
      config.crypto_type = get_crypto_type(CRYPTO_DEFAULT_ALGORITHM);	 
 }

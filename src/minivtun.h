@@ -41,6 +41,14 @@ enum {
 
 #define NM_PI_BUFFER_SIZE  (1024 * 8)
 
+/* Size needed for an encryption/decryption output buffer.
+ * A full IPDATA message is MINIVTUN_MSG_IPDATA_OFFSET + NM_PI_BUFFER_SIZE bytes.
+ * Block-cipher padding can add up to CRYPTO_MAX_BLOCK_SIZE-1 bytes.
+ * Per-message random IV (CRYPTO_MAX_BLOCK_SIZE bytes) is prepended to the output.
+ * Use this constant for all crypt_buffer and receive buffer declarations. */
+#define NM_CRYPTO_BUF_SIZE \
+	(NM_PI_BUFFER_SIZE + MINIVTUN_MSG_IPDATA_OFFSET + 2 * CRYPTO_MAX_BLOCK_SIZE)
+
 struct minivtun_msg {
 	struct {
 		__u8 opcode;
@@ -84,7 +92,7 @@ static inline void netmsg_to_local(void *in, void **out, size_t *dlen)
 }
 
 int run_client(int tunfd, const char *peer_addr_pair);
-int run_server(int tunfd, const char *loc_addr_pair);
+int run_server(const char *loc_addr_pair);
 int vt_route_add(struct in_addr *network, unsigned prefix, struct in_addr *gateway);
 
 #if DEBUG

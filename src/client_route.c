@@ -205,14 +205,16 @@ static struct nlmsghdr * get_route_table(size_t * size)
         size_t received_bufsize = 1024 * 64;
         size_t received_size = 0;
         char * received_buf = (char *)malloc(received_bufsize);
+        if (!received_buf) { close(s); return 0; }
         char * p = received_buf;
-    
+
         while ( received_size < received_bufsize ) {
-    
+
               // receive
               rv = recv(s, p, received_bufsize - received_size, 0);
-              if ( rv < 0 ) {
+              if ( rv <= 0 ) {
                  close(s);
+                 free(received_buf);
                  return 0;
               }
     
@@ -261,8 +263,12 @@ int get_default_route_interface(char * ifname, size_t ifname_len)
     // Now route table is in buf
     int has_default_route = 0;
 
-    for ( struct rt_msghdr2 * rtm = buf; rtm < (struct rt_msghdr2 *)((char *)buf + space_required); 
+    for ( struct rt_msghdr2 * rtm = buf; rtm < (struct rt_msghdr2 *)((char *)buf + space_required);
           rtm = (struct rt_msghdr2 *)((char *)rtm + rtm->rtm_msglen) ) {
+
+        /* Guard against malformed entries that would cause an infinite loop */
+        if (rtm->rtm_msglen < sizeof(*rtm))
+            break;
 
         struct sockaddr * sa = (struct sockaddr *)(rtm + 1);
 
@@ -296,7 +302,7 @@ int get_default_route_interface(char * ifname, size_t ifname_len)
 
            //
            has_default_route = 1;
-           
+
         } // is_default_route()
 
     } // for rt_msghdr2
@@ -321,8 +327,12 @@ static int is_ip_in_default_route(struct sockaddr_in * addr_in)
        return 0; 
 
     // Now route table is in buf
-    for ( struct rt_msghdr2 * rtm = buf; rtm < (struct rt_msghdr2 *)((char *)buf + space_required); 
+    for ( struct rt_msghdr2 * rtm = buf; rtm < (struct rt_msghdr2 *)((char *)buf + space_required);
           rtm = (struct rt_msghdr2 *)((char *)rtm + rtm->rtm_msglen) ) {
+
+        /* Guard against malformed entries that would cause an infinite loop */
+        if (rtm->rtm_msglen < sizeof(*rtm))
+            break;
 
         struct sockaddr * sa = (struct sockaddr *)(rtm + 1);
 

@@ -102,7 +102,7 @@ struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len,
 // Handling packets received from Internet.
 static int network_receiving(int tunfd, int sockfd)
 {
-	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
+	char read_buffer[NM_CRYPTO_BUF_SIZE], crypt_buffer[NM_CRYPTO_BUF_SIZE];
 	struct minivtun_msg *nmsg;
 	struct tun_pi pi;
 	// void *out_data;
@@ -113,7 +113,7 @@ static int network_receiving(int tunfd, int sockfd)
 	int rc;
 
 	real_peer_alen = sizeof(real_peer);
-	rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0, (struct sockaddr *)&real_peer, &real_peer_alen);
+	rc = (int)recvfrom(sockfd, &read_buffer, sizeof(read_buffer), 0, (struct sockaddr *)&real_peer, &real_peer_alen);
 
 #if DEBUG	
     printf("Read %d bytes from network\n", rc);
@@ -230,7 +230,7 @@ void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, v
 // outside.
 static int tunnel_receiving(int tunfd, int sockfd)
 {
-	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
+	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_CRYPTO_BUF_SIZE];
 	struct tun_pi *pi = (void *)read_buffer;
 	// struct minivtun_msg nmsg;
 	void *out_data;
@@ -238,7 +238,10 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	int rc;
 
 	rc = (int)read(tunfd, pi, NM_PI_BUFFER_SIZE);
-	if (rc < sizeof(struct tun_pi))
+	/* Check rc <= 0 first (signed) before the sizeof comparison (unsigned).
+	 * Without this, rc=-1 would be promoted to a huge size_t, passing the
+	 * sizeof guard and causing ip_dlen to wrap to ~4 GB. */
+	if (rc <= 0 || (size_t)rc < sizeof(struct tun_pi))
 		return -1;
 
     //
@@ -323,7 +326,7 @@ void _keepalive_make(void ** out_msg, size_t * out_len)
 static int peer_keepalive(int sockfd)
 {
 	// char in_data[64], crypt_buffer[64];
-	char crypt_buffer[64];
+	char crypt_buffer[128];
 	// struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
 	void *out_msg;
 	size_t out_len;
@@ -517,8 +520,10 @@ reconnect:
 		}
 
 		if (FD_ISSET(tunfd, &rset)) {
-			rc = tunnel_receiving(tunfd, sockfd);
-			assert(rc == 0);
+			if (tunnel_receiving(tunfd, sockfd) != 0) {
+				fprintf(stderr, "TUN read error. About to reconnect.\n");
+				goto reconnect;
+			}
 		}
 	}
 

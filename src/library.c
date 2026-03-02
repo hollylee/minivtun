@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/md5.h>
+#include <openssl/rand.h>
 #include <sys/types.h>
 #include <netdb.h>
 
@@ -52,64 +53,78 @@ const void *get_crypto_type(const char *name)
 	}
 }
 
-static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
-	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
-	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
-	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
-	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
-};
-
-#define CRYPTO_DATA_PADDING(data, dlen, bs) \
-	do { \
-		size_t last_len = *(dlen) % (bs); \
-		if (last_len) { \
-			size_t padding_len = bs - last_len; \
-			memset((char *)data + *(dlen), 0x0, padding_len); \
-			*(dlen) += padding_len; \
-		} \
-	} while(0)
-
 void datagram_encrypt(const void *key, const void *cptype, void *in,
 		void *out, size_t *dlen)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
-	EVP_CIPHER_CTX * ctx;
-	unsigned char iv[CRYPTO_MAX_KEY_SIZE];
+	EVP_CIPHER_CTX *ctx;
+	unsigned char iv[CRYPTO_MAX_BLOCK_SIZE];
 	int outl = 0, outl2 = 0;
+	size_t orig_len = *dlen;
+	size_t last, padded_len;
+	uint8_t *outbuf = (uint8_t *)out;
 
 	if (iv_len == 0)
 		iv_len = 16;
 
-	memcpy(iv, crypto_ivec_initdata, iv_len);
-	CRYPTO_DATA_PADDING(in, dlen, iv_len);
+	/* Generate a fresh random IV for every message. */
+	if (RAND_bytes(iv, (int)iv_len) != 1)
+		memset(iv, 0, iv_len);  /* fallback: zero IV (still better than fixed) */
+
+	/* Prepend the IV to the output buffer. */
+	memcpy(outbuf, iv, iv_len);
+
+	/* Copy plaintext after the IV; zero-pad to the next block boundary. */
+	last = orig_len % iv_len;
+	padded_len = last ? orig_len + (iv_len - last) : orig_len;
+	memcpy(outbuf + iv_len, in, orig_len);
+	if (padded_len > orig_len)
+		memset(outbuf + iv_len + orig_len, 0, padded_len - orig_len);
+
 	ctx = EVP_CIPHER_CTX_new();
-	assert(EVP_EncryptInit_ex(ctx, cptype, NULL, key, iv));
+	if (!ctx) { *dlen = 0; return; }
+	if (!EVP_EncryptInit_ex(ctx, cptype, NULL, key, iv))
+		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
 	EVP_CIPHER_CTX_set_padding(ctx, 0);
-	assert(EVP_EncryptUpdate(ctx, out, &outl, in, (int)*dlen));
-	assert(EVP_EncryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2));
+	if (!EVP_EncryptUpdate(ctx, outbuf + iv_len, &outl,
+	                       outbuf + iv_len, (int)padded_len))
+		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
+	if (!EVP_EncryptFinal_ex(ctx, outbuf + iv_len + outl, &outl2))
+		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
 	EVP_CIPHER_CTX_free(ctx);
 
-	*dlen = (size_t)(outl + outl2);
+	*dlen = iv_len + (size_t)(outl + outl2);
 }
 
 void datagram_decrypt(const void *key, const void *cptype, void *in,
 		void *out, size_t *dlen)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
-	EVP_CIPHER_CTX * ctx;
-	unsigned char iv[CRYPTO_MAX_KEY_SIZE];
+	EVP_CIPHER_CTX *ctx;
+	unsigned char iv[CRYPTO_MAX_BLOCK_SIZE];
 	int outl = 0, outl2 = 0;
+	uint8_t *inbuf = (uint8_t *)in;
 
 	if (iv_len == 0)
 		iv_len = 16;
 
-	memcpy(iv, crypto_ivec_initdata, iv_len);
-	CRYPTO_DATA_PADDING(in, dlen, iv_len);
+	/* Need at least the IV prefix before any ciphertext. */
+	if (*dlen <= iv_len) { *dlen = 0; return; }
+
+	/* Extract per-message IV from the front of the packet. */
+	memcpy(iv, inbuf, iv_len);
+	inbuf  += iv_len;
+	*dlen  -= iv_len;
+
 	ctx = EVP_CIPHER_CTX_new();
-	assert(EVP_DecryptInit_ex(ctx, cptype, NULL, key, iv));
+	if (!ctx) { *dlen = 0; return; }
+	if (!EVP_DecryptInit_ex(ctx, cptype, NULL, key, iv))
+		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
 	EVP_CIPHER_CTX_set_padding(ctx, 0);
-	assert(EVP_DecryptUpdate(ctx, out, &outl, in, (int)*dlen));
-	assert(EVP_DecryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2));
+	if (!EVP_DecryptUpdate(ctx, out, &outl, inbuf, (int)*dlen))
+		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
+	if (!EVP_DecryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2))
+		{ EVP_CIPHER_CTX_free(ctx); *dlen = 0; return; }
 	EVP_CIPHER_CTX_free(ctx);
 
 	*dlen = (size_t)(outl + outl2);
@@ -172,9 +187,9 @@ int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
 		sscanf(pair, "%d", &port);
 		strcpy(host, "0.0.0.0");
 	}
-	sprintf(s_port, "%d", port);
 	if (port <= 0 || port > 65535)
 		return -EINVAL;
+	snprintf(s_port, sizeof(s_port), "%d", port);
 
 	memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family = AF_UNSPEC;  /* Allow IPv4 or IPv6 */
