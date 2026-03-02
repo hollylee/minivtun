@@ -269,7 +269,7 @@ static void handle_client_tcp4(int sockfd,
 		/* Pick a cryptographically random ISN for the server side */
 		if (RAND_bytes((unsigned char *)&conn->srv_iss, sizeof(conn->srv_iss)) != 1)
 			conn->srv_iss = (uint32_t)(time(NULL) ^ (uintptr_t)conn);
-		conn->srv_seq = conn->srv_iss + 1; /* will be sent after SYN-ACK */
+		conn->srv_seq = conn->srv_iss; /* SYN-ACK SEQ = ISN; advances to ISN+1 after handshake */
 
 		conn->fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (conn->fd < 0) {
@@ -412,7 +412,7 @@ static void handle_client_tcp6(int sockfd,
 		conn->clt_seq = seq + 1;
 		if (RAND_bytes((unsigned char *)&conn->srv_iss, sizeof(conn->srv_iss)) != 1)
 			conn->srv_iss = (uint32_t)(time(NULL) ^ (uintptr_t)conn);
-		conn->srv_seq = conn->srv_iss + 1;
+		conn->srv_seq = conn->srv_iss; /* SYN-ACK SEQ = ISN; advances to ISN+1 after handshake */
 
 		conn->fd = socket(AF_INET6, SOCK_STREAM, 0);
 		if (conn->fd < 0) { tcp_conn_remove(conn); return; }
@@ -537,8 +537,8 @@ static void handle_tcp_nat_event(int sockfd, struct tcp_conn *conn,
 					               PB_TH_SYN | PB_TH_ACK,
 					               mss_opt, 4, NULL, 0);
 				}
-				/* srv_seq advances by 1 for the SYN */
-				/* (srv_seq was already set to srv_iss+1 at creation) */
+				/* SYN consumes one sequence number */
+				conn->srv_seq++;
 				conn->state = TCP_SYN_ACK_SENT;
 			}
 		}
