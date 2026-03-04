@@ -27,6 +27,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+/* TCP_MAXSEG is 2 on both Linux and macOS; avoid including <netinet/tcp.h>
+ * because on Linux it pollutes the namespace with TCP state enum values that
+ * clash with our own tcp_state enum in natmap.h. */
+#ifndef TCP_MAXSEG
+#define TCP_MAXSEG 2
+#endif
+
 #ifdef __linux__
 #  include <netinet/icmp6.h>
 #  include <netinet/ip6.h>
@@ -331,6 +338,10 @@ static void handle_client_tcp4(int sockfd,
 			return;
 		}
 		set_nonblock(conn->fd);
+		{
+			int mss = PB_TCP_MSS;
+			setsockopt(conn->fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
+		}
 
 		memset(&dst_addr, 0, sizeof(dst_addr));
 		dst_addr.sin_family      = AF_INET;
@@ -480,6 +491,10 @@ static void handle_client_tcp6(int sockfd,
 		conn->fd = socket(AF_INET6, SOCK_STREAM, 0);
 		if (conn->fd < 0) { tcp_conn_remove(conn); return; }
 		set_nonblock(conn->fd);
+		{
+			int mss = PB_TCP_MSS;
+			setsockopt(conn->fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
+		}
 
 		memset(&dst_addr, 0, sizeof(dst_addr));
 		dst_addr.sin6_family = AF_INET6;
@@ -622,7 +637,11 @@ static void handle_tcp_nat_event(int sockfd, struct tcp_conn *conn,
 		uint8_t buf[NM_PI_BUFFER_SIZE];
 		ssize_t n;
 
-		n = read(conn->fd, buf, sizeof(buf));
+		/* Limit each read to PB_TCP_MSS bytes so the synthesised inner TCP
+		 * segment (payload + 20 IP + 20 TCP = PB_TCP_MSS + 40) never exceeds
+		 * the VPN tunnel MTU (config.tun_mtu = 1300).  Remaining kernel
+		 * buffer data is picked up on the next poll() iteration. */
+		n = read(conn->fd, buf, PB_TCP_MSS);
 
 		if (n <= 0) {
 			/* Real server closed or error: send FIN to client */

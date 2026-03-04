@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <arpa/inet.h>
 #include <stdio.h>
 
@@ -43,14 +44,30 @@ static int is_default_route(struct sockaddr * dest_addr, struct sockaddr * mask_
        struct sockaddr_in * dest_in = (struct sockaddr_in *)dest_addr;
        struct sockaddr_in * mask_in = (struct sockaddr_in *)mask_addr;
 #if DEBUG
-       printf("is_default_route: dest %s, mask %s (0x%x)\n", 
-              inet_ntoa(dest_in->sin_addr), 
-              (mask_addr != 0 ? inet_ntoa(mask_in->sin_addr): ""), 
-              (mask_addr != 0 ? mask_in->sin_addr.s_addr : 0))  ;
-#endif       
+       {
+           char s_dest[INET_ADDRSTRLEN], s_mask[INET_ADDRSTRLEN];
+           inet_ntop(AF_INET, &dest_in->sin_addr, s_dest, sizeof(s_dest));
+           if (mask_addr != 0 && (size_t)mask_in->sin_len > offsetof(struct sockaddr_in, sin_addr))
+               inet_ntop(AF_INET, &mask_in->sin_addr, s_mask, sizeof(s_mask));
+           else
+               snprintf(s_mask, sizeof(s_mask), "(len=%u)", mask_addr ? mask_in->sin_len : 0);
+           printf("is_default_route: dest %s, mask %s\n", s_dest, s_mask);
+       }
+#endif
 
-       return (dest_in->sin_addr.s_addr == INADDR_ANY) && 
-              (mask_in == 0 || mask_in->sin_addr.s_addr == 0 || mask_in->sin_len == 0);
+       if (dest_in->sin_addr.s_addr != INADDR_ANY)
+           return 0;
+
+       /* Mask is absent or empty */
+       if (mask_in == 0 || mask_in->sin_len == 0)
+           return 1;
+
+       /* BSD compact netmask: sin_len too small to contain sin_addr (e.g. sin_len=4
+        * for a /0 default route).  Reading sin_addr would be out-of-bounds. */
+       if ((size_t)mask_in->sin_len <= offsetof(struct sockaddr_in, sin_addr))
+           return 1;
+
+       return mask_in->sin_addr.s_addr == INADDR_ANY;
 }
 
 
@@ -287,11 +304,9 @@ int get_default_route_interface(char * ifname, size_t ifname_len)
         // Check default route
         if ( is_default_route(rti_info[RTAX_DST], rti_info[RTAX_NETMASK]) ) {
 
-           // more than one default route...
-           if ( has_default_route ) {
-              free(buf);
-              return -EEXIST;
-           }
+           // Already found one — skip additional default routes (ECMP / VPN splits)
+           if ( has_default_route )
+              continue;
 
            // Get interface name of the default route
            char if_name[IFNAMSIZ] = { 0 };
