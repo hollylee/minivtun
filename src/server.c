@@ -192,6 +192,33 @@ static void send_inner_to_peer(int sockfd, struct vpn_peer *peer,
 	       (struct sockaddr *)&peer->udp_addr, alen);
 }
 
+/* Send a VPN keepalive packet to a peer (used to acknowledge client keepalives
+ * so that the client's last_recv stays fresh and it doesn't reconnect) */
+static void send_keepalive_to_peer(int sockfd, struct vpn_peer *peer)
+{
+	char in_data[64], crypt_buffer[128];
+	struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
+	void *out_msg;
+	size_t out_len;
+	socklen_t alen;
+
+	nmsg->hdr.opcode = MINIVTUN_MSG_KEEPALIVE;
+	memset(nmsg->hdr.rsv, 0, sizeof(nmsg->hdr.rsv));
+	memcpy(nmsg->hdr.auth_key, config.crypto_key, sizeof(nmsg->hdr.auth_key));
+	nmsg->keepalive.loc_tun_in  = config.local_tun_in;
+	nmsg->keepalive.loc_tun_in6 = config.local_tun_in6;
+
+	out_msg = crypt_buffer;
+	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
+	local_to_netmsg(nmsg, &out_msg, &out_len);
+
+	alen = (peer->udp_addr.ss_family == AF_INET6)
+	       ? sizeof(struct sockaddr_in6)
+	       : sizeof(struct sockaddr_in);
+	sendto(sockfd, out_msg, out_len, 0,
+	       (struct sockaddr *)&peer->udp_addr, alen);
+}
+
 /* -----------------------------------------------------------------------
  * Inter-client routing: forward inner packet to another VPN peer
  * ----------------------------------------------------------------------- */
@@ -1325,11 +1352,19 @@ static void network_receiving(int sockfd)
 #endif
 		if (is_valid_unicast_in(&ka_in4)) {
 			peer = peer_get_or_create(AF_INET, &ka_in4, &real_peer);
-			if (peer) peer->last_active = time(NULL);
+			if (peer) {
+				peer->last_active = time(NULL);
+				/* Echo keepalive back so client's last_recv stays
+				 * fresh and it doesn't close/reopen its UDP socket */
+				send_keepalive_to_peer(sockfd, peer);
+			}
 		}
 		if (is_valid_unicast_in6(&ka_in6)) {
 			peer = peer_get_or_create(AF_INET6, &ka_in6, &real_peer);
-			if (peer) peer->last_active = time(NULL);
+			if (peer) {
+				peer->last_active = time(NULL);
+				send_keepalive_to_peer(sockfd, peer);
+			}
 		}
 		break;
 	}
