@@ -64,6 +64,10 @@ struct tcp_conn {
 	uint32_t srv_iss;   /* our Initial Sequence Number (chosen at SYN-ACK) */
 	uint32_t srv_seq;   /* next seq we send to client */
 
+	/* Client receive window tracking (for flow control) */
+	uint32_t clt_ack;   /* highest srv_seq the client has acknowledged */
+	uint32_t clt_wnd;   /* client's advertised receive window (unscaled) */
+
 	struct vpn_peer *peer;
 	time_t           last_active;
 	struct list_head node;

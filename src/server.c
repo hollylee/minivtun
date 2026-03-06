@@ -332,6 +332,13 @@ static void handle_client_tcp4(int sockfd,
 			conn->srv_iss = (uint32_t)(time(NULL) ^ (uintptr_t)conn);
 		conn->srv_seq = conn->srv_iss; /* SYN-ACK SEQ = ISN; advances to ISN+1 after handshake */
 
+		/* Initialise client-window tracking from SYN.
+		 * clt_ack starts at srv_iss (nothing ACKed yet).
+		 * clt_wnd is taken from the SYN window field (no scaling yet). */
+		conn->clt_ack = conn->srv_iss;
+		conn->clt_wnd = ntohs(tcph->window);
+		if (conn->clt_wnd == 0) conn->clt_wnd = 65535; /* guard */
+
 		conn->fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (conn->fd < 0) {
 			tcp_conn_remove(conn);
@@ -371,6 +378,17 @@ static void handle_client_tcp4(int sockfd,
 
 	conn->last_active = time(NULL);
 
+	/* Always track the client's receive window from every incoming packet.
+	 * This is used by the drain loop (handle_tcp_nat_event) and by
+	 * natmap_build_pollfd() to avoid sending past the client's window. */
+	if (flags & PB_TH_ACK) {
+		uint32_t ack = ntohl(tcph->ack_seq);
+		/* Only advance clt_ack forward (serial number arithmetic) */
+		if ((int32_t)(ack - conn->clt_ack) > 0)
+			conn->clt_ack = ack;
+		conn->clt_wnd = ntohs(tcph->window);
+	}
+
 	switch (conn->state) {
 
 	case TCP_CONNECTING:
@@ -383,7 +401,7 @@ static void handle_client_tcp4(int sockfd,
 			conn->state = TCP_ESTABLISHED;
 		}
 		/* Fall through: if there's also payload, process it */
-		if (!(flags & PB_TH_PSH) || payload_len == 0)
+		if (payload_len == 0)
 			break;
 		/* FALLTHROUGH */
 
@@ -391,19 +409,17 @@ static void handle_client_tcp4(int sockfd,
 	case TCP_FIN_WAIT:
 		/* Forward payload to real server */
 		if (payload_len > 0) {
-			ssize_t n = send(conn->fd, payload, payload_len, 0);
-			if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-				/* Real server gone: send RST to client */
-				conn->srv_seq = ntohl(tcph->ack_seq);
-				tcp4_to_client(sockfd, conn,
-				               PB_TH_RST | PB_TH_ACK,
-				               NULL, 0, NULL, 0);
-				tcp_conn_remove(conn);
-				return;
-			}
-			if (n > 0) {
-				if ((size_t)n < payload_len) {
-					/* Partial write: out-of-sync, RST the connection */
+			if (seq != conn->clt_seq) {
+				/* Out-of-order or retransmit.
+				 * Re-ACK our current position for retransmits (seq behind);
+				 * drop future segments silently (client will retransmit). */
+				if ((int32_t)(seq - conn->clt_seq) < 0)
+					tcp4_to_client(sockfd, conn, PB_TH_ACK,
+					               NULL, 0, NULL, 0);
+			} else {
+				ssize_t n = send(conn->fd, payload, payload_len, 0);
+				if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+					/* Real server gone: send RST to client */
 					conn->srv_seq = ntohl(tcph->ack_seq);
 					tcp4_to_client(sockfd, conn,
 					               PB_TH_RST | PB_TH_ACK,
@@ -411,11 +427,22 @@ static void handle_client_tcp4(int sockfd,
 					tcp_conn_remove(conn);
 					return;
 				}
-				conn->clt_seq = seq + (uint32_t)payload_len;
-				/* Send ACK back to client */
-				tcp4_to_client(sockfd, conn,
-				               PB_TH_ACK,
-				               NULL, 0, NULL, 0);
+				if (n > 0) {
+					if ((size_t)n < payload_len) {
+						/* Partial write: out-of-sync, RST the connection */
+						conn->srv_seq = ntohl(tcph->ack_seq);
+						tcp4_to_client(sockfd, conn,
+						               PB_TH_RST | PB_TH_ACK,
+						               NULL, 0, NULL, 0);
+						tcp_conn_remove(conn);
+						return;
+					}
+					conn->clt_seq = seq + (uint32_t)payload_len;
+					/* Send ACK back to client */
+					tcp4_to_client(sockfd, conn,
+					               PB_TH_ACK,
+					               NULL, 0, NULL, 0);
+				}
 			}
 		}
 
@@ -487,6 +514,9 @@ static void handle_client_tcp6(int sockfd,
 		if (RAND_bytes((unsigned char *)&conn->srv_iss, sizeof(conn->srv_iss)) != 1)
 			conn->srv_iss = (uint32_t)(time(NULL) ^ (uintptr_t)conn);
 		conn->srv_seq = conn->srv_iss; /* SYN-ACK SEQ = ISN; advances to ISN+1 after handshake */
+		conn->clt_ack = conn->srv_iss;
+		conn->clt_wnd = ntohs(tcph->window);
+		if (conn->clt_wnd == 0) conn->clt_wnd = 65535;
 
 		conn->fd = socket(AF_INET6, SOCK_STREAM, 0);
 		if (conn->fd < 0) { tcp_conn_remove(conn); return; }
@@ -521,6 +551,13 @@ static void handle_client_tcp6(int sockfd,
 	if (!conn) return;
 	conn->last_active = time(NULL);
 
+	if (flags & PB_TH_ACK) {
+		uint32_t ack = ntohl(tcph->ack_seq);
+		if ((int32_t)(ack - conn->clt_ack) > 0)
+			conn->clt_ack = ack;
+		conn->clt_wnd = ntohs(tcph->window);
+	}
+
 	switch (conn->state) {
 	case TCP_CONNECTING:
 		break;
@@ -528,24 +565,20 @@ static void handle_client_tcp6(int sockfd,
 	case TCP_SYN_ACK_SENT:
 		if ((flags & PB_TH_ACK) && ntohl(tcph->ack_seq) == conn->srv_iss + 1)
 			conn->state = TCP_ESTABLISHED;
-		if (!(flags & PB_TH_PSH) || payload_len == 0)
+		if (payload_len == 0)
 			break;
 		/* FALLTHROUGH */
 
 	case TCP_ESTABLISHED:
 	case TCP_FIN_WAIT:
 		if (payload_len > 0) {
-			ssize_t n = send(conn->fd, payload, payload_len, 0);
-			if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-				conn->srv_seq = ntohl(tcph->ack_seq);
-				tcp6_to_client(sockfd, conn,
-				               PB_TH_RST | PB_TH_ACK,
-				               NULL, 0, NULL, 0);
-				tcp_conn_remove(conn);
-				return;
-			}
-			if (n > 0) {
-				if ((size_t)n < payload_len) {
+			if (seq != conn->clt_seq) {
+				if ((int32_t)(seq - conn->clt_seq) < 0)
+					tcp6_to_client(sockfd, conn, PB_TH_ACK,
+					               NULL, 0, NULL, 0);
+			} else {
+				ssize_t n = send(conn->fd, payload, payload_len, 0);
+				if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 					conn->srv_seq = ntohl(tcph->ack_seq);
 					tcp6_to_client(sockfd, conn,
 					               PB_TH_RST | PB_TH_ACK,
@@ -553,9 +586,19 @@ static void handle_client_tcp6(int sockfd,
 					tcp_conn_remove(conn);
 					return;
 				}
-				conn->clt_seq = seq + (uint32_t)payload_len;
-				tcp6_to_client(sockfd, conn,
-				               PB_TH_ACK, NULL, 0, NULL, 0);
+				if (n > 0) {
+					if ((size_t)n < payload_len) {
+						conn->srv_seq = ntohl(tcph->ack_seq);
+						tcp6_to_client(sockfd, conn,
+						               PB_TH_RST | PB_TH_ACK,
+						               NULL, 0, NULL, 0);
+						tcp_conn_remove(conn);
+						return;
+					}
+					conn->clt_seq = seq + (uint32_t)payload_len;
+					tcp6_to_client(sockfd, conn,
+					               PB_TH_ACK, NULL, 0, NULL, 0);
+				}
 			}
 		}
 		if ((flags & PB_TH_FIN) && conn->state == TCP_ESTABLISHED) {
@@ -637,38 +680,49 @@ static void handle_tcp_nat_event(int sockfd, struct tcp_conn *conn,
 		uint8_t buf[NM_PI_BUFFER_SIZE];
 		ssize_t n;
 
-		/* Limit each read to PB_TCP_MSS bytes so the synthesised inner TCP
-		 * segment (payload + 20 IP + 20 TCP = PB_TCP_MSS + 40) never exceeds
-		 * the VPN tunnel MTU (config.tun_mtu = 1300).  Remaining kernel
-		 * buffer data is picked up on the next poll() iteration. */
-		n = read(conn->fd, buf, PB_TCP_MSS);
+		/* Drain the socket in a loop, respecting the client's receive
+		 * window.  Each iteration sends one VPN-sized segment (≤ PB_TCP_MSS
+		 * bytes).  We stop when the kernel buffer is empty (EAGAIN) OR when
+		 * the client's window is full to avoid sending data that the client's
+		 * TCP stack will silently drop (since we can't retransmit it). */
+		for (;;) {
+			uint32_t wnd_edge = conn->clt_ack + conn->clt_wnd;
+			int32_t  wnd_left = (int32_t)(wnd_edge - conn->srv_seq);
+			if (wnd_left <= 0)
+				break;  /* client window full; wait for ACK/window update */
+			size_t max_read = (wnd_left < PB_TCP_MSS) ? (size_t)wnd_left
+			                                          : (size_t)PB_TCP_MSS;
+			n = read(conn->fd, buf, max_read);
 
-		if (n <= 0) {
-			/* Real server closed or error: send FIN to client */
+			if (n <= 0) {
+				if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+					break;  /* buffer drained, all done */
+				/* Real server closed or error: send FIN to client */
+				if (conn->af == AF_INET) {
+					tcp4_to_client(sockfd, conn,
+					               PB_TH_FIN | PB_TH_ACK,
+					               NULL, 0, NULL, 0);
+				} else {
+					tcp6_to_client(sockfd, conn,
+					               PB_TH_FIN | PB_TH_ACK,
+					               NULL, 0, NULL, 0);
+				}
+				tcp_conn_remove(conn);
+				return;
+			}
+
+			/* Forward data to client */
 			if (conn->af == AF_INET) {
 				tcp4_to_client(sockfd, conn,
-				               PB_TH_FIN | PB_TH_ACK,
-				               NULL, 0, NULL, 0);
+				               PB_TH_PSH | PB_TH_ACK,
+				               NULL, 0, buf, (size_t)n);
 			} else {
 				tcp6_to_client(sockfd, conn,
-				               PB_TH_FIN | PB_TH_ACK,
-				               NULL, 0, NULL, 0);
+				               PB_TH_PSH | PB_TH_ACK,
+				               NULL, 0, buf, (size_t)n);
 			}
-			tcp_conn_remove(conn);
-			return;
+			conn->srv_seq += (uint32_t)n;
 		}
-
-		/* Forward data to client */
-		if (conn->af == AF_INET) {
-			tcp4_to_client(sockfd, conn,
-			               PB_TH_PSH | PB_TH_ACK,
-			               NULL, 0, buf, (size_t)n);
-		} else {
-			tcp6_to_client(sockfd, conn,
-			               PB_TH_PSH | PB_TH_ACK,
-			               NULL, 0, buf, (size_t)n);
-		}
-		conn->srv_seq += (uint32_t)n;
 		conn->last_active = time(NULL);
 	}
 }
@@ -882,6 +936,15 @@ static int icmp_socket_create(int af, uint16_t *mapped_id, int *p_sock_type)
 		*mapped_id = ntohs(sin6.sin6_port);
 	}
 
+	/* SOCK_RAW sockets have no port concept; getsockname returns the protocol
+	 * number (e.g. IPPROTO_ICMP=1), not a unique per-socket value.
+	 * Assign a unique ID from a counter so parallel flows don't collide. */
+	if (*p_sock_type == SOCK_RAW) {
+		static uint16_t raw_id_seq = 1;
+		*mapped_id = raw_id_seq++;
+		if (*mapped_id == 0) *mapped_id = raw_id_seq++;  /* skip 0 */
+	}
+
 #ifdef __linux__
 	/* For ICMPv6 raw sockets, filter to only echo replies */
 	if (af == AF_INET6) {
@@ -1090,11 +1153,15 @@ static void handle_icmp_nat_event(int sockfd, struct icmp_flow *flow)
 		{
 			const struct pb_icmphdr *rep = (const struct pb_icmphdr *)icmp_start;
 
-			/* Validate that we received the expected reply type */
+			/* Validate reply type and ID.
+			 * ID check is critical for SOCK_RAW: all raw sockets receive
+			 * all ICMP traffic, so we must filter to our own mapped_id. */
 			if (flow->af == AF_INET && rep->type != PB_ICMP_ECHO_REPLY)
 				return;
 			if (flow->af == AF_INET6 &&
 			    rep->type != (uint8_t)PB_ICMPV6_ECHO_REPLY)
+				return;
+			if (ntohs(rep->id) != flow->mapped_id)
 				return;
 
 			uint16_t rep_seq  = ntohs(rep->seq);
@@ -1368,6 +1435,10 @@ int run_server(const char *loc_addr_pair)
 		FILE *fp = fopen(config.pid_file, "w");
 		if (fp) { fprintf(fp, "%d\n", (int)getpid()); fclose(fp); }
 	}
+
+	/* Ignore SIGPIPE so that send() to a broken TCP socket returns EPIPE
+	 * instead of killing the process.  Standard practice for servers. */
+	signal(SIGPIPE, SIG_IGN);
 
 	last_walk = time(NULL);
 
