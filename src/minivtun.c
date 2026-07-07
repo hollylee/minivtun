@@ -36,7 +36,8 @@ struct minivtun_config config = {
 	.wait_dns = false,
 	.send_all_traffic = false,
 	.bind_to_addr = "",
-	.bind_if = ""
+	.bind_if = "",
+    .use_tcp = false                 // Use UDP by default
 };
 
 #if !defined( __APPLE_NETWORK_EXTENSION__ ) && !defined( __ANDROID_VPN_SERVICE__ )
@@ -65,6 +66,7 @@ static struct option long_opts[] = {
 	{ "help", no_argument, 0, 'h', },
 	{ "send-all-traffic", no_argument, 0, 'f' },
 	{ "bind-to-addr", required_argument, 0, 'b' },
+    { "use-tcp", no_argument, 0, 'T' },
 	{ 0, 0, 0, 0, },
 };
 
@@ -94,6 +96,7 @@ static void print_help(int argc, char *argv[])
 	printf("  -d, --daemon                        run as daemon process\n");
 	printf("  -f, --send-all-traffic              send all traffic through the tunnel\n");
 	printf("  -b, --bind-to-addr <addr>           bind to specified address. If omitted, would be bound to the address with the first default route.");
+	printf("  -T, --use-tcp                       Use tcp transport instead of udp.");
 	printf("  -h, --help                          print this help\n");
 	printf("Supported encryption types:\n");
 	printf("  ");
@@ -303,6 +306,9 @@ int main(int argc, char *argv[])
 		case 'f':
 		    config.send_all_traffic = 1;
 			break;
+        case 'T':
+            config.use_tcp = true;
+            break;
 		case 'b':
 			strncpy(config.bind_to_addr, optarg, sizeof(config.bind_to_addr) - 1);
 			break;

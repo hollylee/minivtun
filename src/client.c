@@ -196,7 +196,7 @@ static int network_receiving(int tunfd, int sockfd)
 //	return 0;
 }
 
-#endif // __APPLE_NETWORK_EXTENSION__
+#endif // !__APPLE_NETWORK_EXTENSION__
 
 
 void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void ** out_data, size_t * out_dlen)

@@ -31,6 +31,9 @@ struct minivtun_config {
 	int send_all_traffic;
 	char bind_to_addr[64];
 	char bind_if[IFNAMSIZ];
+
+    // v2: using tcp instead of udp
+    bool use_tcp;
 };
 
 enum {
