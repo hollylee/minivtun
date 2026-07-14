@@ -96,7 +96,7 @@ static void print_help(int argc, char *argv[])
 	printf("  -d, --daemon                        run as daemon process\n");
 	printf("  -f, --send-all-traffic              send all traffic through the tunnel\n");
 	printf("  -b, --bind-to-addr <addr>           bind to specified address. If omitted, would be bound to the address with the first default route.");
-	printf("  -T, --use-tcp                       Use tcp transport instead of udp.");
+	printf("  -T, --use-tcp                       Use tcp transport instead of udp. (client only)");
 	printf("  -h, --help                          print this help\n");
 	printf("Supported encryption types:\n");
 	printf("  ");

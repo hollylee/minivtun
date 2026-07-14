@@ -27,6 +27,17 @@
 static time_t current_ts = 0;
 static uint32_t hash_initval = 0;
 
+/* tcp clients 
+#define TCP_CLIENT_MAX     256
+
+static int tcp_clients[TCP_CLIENT_MAX];
+static unsigned tcp_client_count = 0;
+
+// We are in non-blocking mode, so we need spaces to store patial read-in data
+static uint8_t tcp_client_data_buffer[TCP_CLIENT_MAX][NM_PI_BUFFER_SIZE]; // 256 * 8K = 2M
+static unsigned tcp_client_data_buffer_length[TCP_CLIENT_MAX];
+*/
+
 /**
  * Pseudo route table for binding client side subnets
  * to corresponding connected virtual addresses.
@@ -82,19 +93,27 @@ static struct in_addr *vt_route_lookup(const struct in_addr *addr)
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
+// ra means real addr. Real address means the address of the client transport
 struct ra_entry {
-	struct list_head list;
-	struct sockaddr_inx real_addr;
+	struct list_head list; // link inside the ra_set_hbase hash table entry.
+	struct sockaddr_inx real_addr; // The real address of the client
 	time_t last_recv;
 	time_t last_xmit;
-	int refs;
+    int refs; // Maintains the reference count of current usage. ra_get_or_create will increase it and ra_put_no_free will decrease it
 };
 
 /* Hash table for dedicated clients (real addresses). */
 #define RA_SET_HASH_SIZE  (1 << 3)
 #define RA_SET_LIMIT_EACH_WALK  (10)
-static struct list_head ra_set_hbase[RA_SET_HASH_SIZE];
+static struct list_head ra_set_hbase[RA_SET_HASH_SIZE];  // 8 entries. hash key: real address.
 static unsigned ra_set_len;
+
+// A standalone ra_entry hash table for accepted but no packet arrived tcp connections
+static struct list_head tun_clients_accepted_only; // list of tun_client
+static unsigned tun_clients_accepted_only_len = 0;
+
+
+#define RA_ENTRY_LIST_HEAD(_raddr_, _base_)  &((_base_)[real_addr_hash(_raddr_) & (RA_SET_HASH_SIZE - 1)])
 
 static inline uint32_t real_addr_hash(const struct sockaddr_inx *sa)
 {
@@ -109,8 +128,7 @@ static inline uint32_t real_addr_hash(const struct sockaddr_inx *sa)
 
 static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa)
 {
-	struct list_head *chain = &ra_set_hbase[
-		real_addr_hash(sa) & (RA_SET_HASH_SIZE - 1)];
+	struct list_head *chain = &ra_set_hbase[real_addr_hash(sa) & (RA_SET_HASH_SIZE - 1)];
 	struct ra_entry *re;
 	char s_real_addr[50];
 
@@ -141,6 +159,7 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa)
 
 static inline void ra_put_no_free(struct ra_entry *re)
 {
+    assert(re != NULL);
 	assert(re->refs > 0);
 	re->refs--;
 }
@@ -149,6 +168,7 @@ static inline void ra_entry_release(struct ra_entry *re)
 {
 	char s_real_addr[50];
 
+    assert(re != NULL);
 	assert(re->refs == 0);
 	list_del(&re->list);
 	ra_set_len--;
@@ -160,6 +180,8 @@ static inline void ra_entry_release(struct ra_entry *re)
 	free(re);
 }
 
+// address of the tun interface. Since different clients must have different addresses, this is enough
+// to distinguish the clients.
 struct tun_addr {
 	unsigned short af;
 	union {
@@ -167,20 +189,32 @@ struct tun_addr {
 		struct in6_addr in6;
 	};
 };
+
+// Identify a client 
 struct tun_client {
-	struct list_head list;
-	struct tun_addr virt_addr;
-	struct ra_entry *ra;
-	time_t last_recv;
-	time_t last_xmit;
+	struct list_head list;      // link inside the list inside va_map_hbase.
+	struct tun_addr virt_addr;  // client's address (tun address in client)
+	struct ra_entry *ra;        // Point to a real address entry (one to one). NULL if this is a client just acceoted
+	time_t last_recv;           // The time received last packet from the client
+	time_t last_xmit;           // The time we sent last packet to the client
+
+    // New fields for tcp transport only.
+    bool accepted_only;
+    bool is_tcp;
+    int client_fd;
+    uint8_t tcp_read_buffer[NM_PI_BUFFER_SIZE];
+    size_t tcp_read_buffer_len;
 };
 
 /* Hash table of virtual address in tunnel. */
 #define VA_MAP_HASH_SIZE  (1 << 4)
 #define VA_MAP_LIMIT_EACH_WALK  (10)
-static struct list_head va_map_hbase[VA_MAP_HASH_SIZE];
-static unsigned va_map_len;
+static struct list_head va_map_hbase[VA_MAP_HASH_SIZE]; // 16 entries hash table. hash key is client's virtual address
+static unsigned va_map_len; // Total vaddrs in va_map_hbase[]
 
+
+
+// 
 static inline void init_va_ra_maps(void)
 {
 	int i;
@@ -192,7 +226,41 @@ static inline void init_va_ra_maps(void)
 	for (i = 0; i < RA_SET_HASH_SIZE; i++)
 		INIT_LIST_HEAD(&ra_set_hbase[i]);
 	ra_set_len = 0;
+
+    INIT_LIST_HEAD(&tun_clients_accepted_only);
+    tun_clients_accepted_only_len = 0;
 }
+
+
+// Create and link into 
+static 
+struct tun_client * tun_client_create_accepted_only(struct sockaddr_inx * real_addr, int client_fd)
+{
+    struct tun_client * tclient = (struct tun_client *)malloc(sizeof(struct tun_client));
+    if ( tclient == NULL )
+       return NULL;
+
+    tclient->ra = ra_get_or_create(real_addr);
+    if ( tclient->ra == NULL ) {
+        free(tclient);
+        return NULL;
+    }
+
+    tclient->last_recv = tclient->last_xmit = 0;
+    tclient->is_tcp = true;
+    tclient->accepted_only = true;
+    tclient->client_fd = client_fd;
+
+    tclient->tcp_read_buffer_len = 0;
+
+    // Link into 
+    list_add_tail(&(tclient->list), &tun_clients_accepted_only);
+    tun_clients_accepted_only_len++;
+
+    return tclient;
+}
+
+
 
 static inline uint32_t tun_addr_hash(const struct tun_addr *addr)
 {
@@ -208,6 +276,7 @@ static inline uint32_t tun_addr_hash(const struct tun_addr *addr)
 	}
 }
 
+// Compare 2 tun addrs. Must be same address family and addres value
 static inline int tun_addr_comp(
 		const struct tun_addr *a1, const struct tun_addr *a2)
 {
@@ -249,16 +318,18 @@ static inline void tun_client_dump(struct tun_client *ce)
 
 static inline void tun_client_release(struct tun_client *ce)
 {
-	char s_virt_addr[50], s_real_addr[50];
+	char s_virt_addr[50] = { 0}, s_real_addr[50] = { 0 };
 
 	inet_ntop(ce->virt_addr.af, &ce->virt_addr.in, s_virt_addr,
 			  sizeof(s_virt_addr));
-	inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
-			  s_real_addr, sizeof(s_real_addr));
-	printf("Recycled virtual address [%s] at [%s:%u].\n", s_virt_addr, s_real_addr,
+
+    inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
+	    	  s_real_addr, sizeof(s_real_addr));
+
+   	printf("Recycled virtual address [%s] at [%s:%u].\n", s_virt_addr, s_real_addr,
 			ntohs(port_of_sockaddr(&ce->ra->real_addr)));
 
-	ra_put_no_free(ce->ra);
+    ra_put_no_free(ce->ra);
 
 	list_del(&ce->list);
 	va_map_len--;
@@ -266,6 +337,27 @@ static inline void tun_client_release(struct tun_client *ce)
 	free(ce);
 }
 
+static inline void tun_client_release_from_accepted(struct tun_client *ce)
+{
+    assert(ce->accepted_only && ce->is_tcp && ce->client_fd >= 0);
+
+	char s_real_addr[50] = { 0 };
+
+    inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
+	    	  s_real_addr, sizeof(s_real_addr));
+
+   	printf("Recycled accepted only client at [%s:%u].\n", s_real_addr,
+			ntohs(port_of_sockaddr(&ce->ra->real_addr)));
+
+    ra_put_no_free(ce->ra);
+
+	list_del(&ce->list);
+	tun_clients_accepted_only_len--;
+
+	free(ce);
+}
+
+/** Try to get tun_client from the virtual address */
 static struct tun_client *tun_client_try_get(const struct tun_addr *vaddr)
 {
 	struct list_head *chain = &va_map_hbase[
@@ -279,17 +371,51 @@ static struct tun_client *tun_client_try_get(const struct tun_addr *vaddr)
 	return NULL;
 }
 
+/** 
+ *  Try to get, create if not exist. Note this function requires a real address argument, 
+ *  so it can handle real address change case. 
+ * 
+ *  tcp_client_fd < 0 means it is a udp client.
+ * 
+ *  The tcp client is created in connection acceptance stage. At that time we don't know what vaddr is
+ */
 static struct tun_client *tun_client_get_or_create(
-		const struct tun_addr *vaddr, const struct sockaddr_inx *raddr)
+		const struct tun_addr *vaddr, const struct sockaddr_inx *raddr, int tcp_client_fd)
 {
 	struct list_head *chain = &va_map_hbase[
 		tun_addr_hash(vaddr) & (VA_MAP_HASH_SIZE - 1)];
 	struct tun_client *ce, *__ce;
 	char s_virt_addr[50], s_real_addr[50];
 
+    // UDP: raddr != NULL. TCP: tcp_client_fd >= 0
+    assert(raddr != NULL || tcp_client_fd >= 0);
+
+    // Iterate the list indicated by chain. chain points to a list (an entry) in hash map
 	list_for_each_entry_safe (ce, __ce, chain, list) {
+
+        // Have this virtual address.
 		if (tun_addr_comp(&ce->virt_addr, vaddr) == 0) {
-			if (!is_sockaddr_equal(&ce->ra->real_addr, raddr)) {
+
+            // Only when this called from accept_connection() after accepted new tcp client
+            if ( raddr == NULL ) {
+               // Real address changed
+               if ( ce->ra != NULL ) {
+                  ra_put_no_free(ce->ra);                
+                  ce->ra = NULL;
+               }
+            }
+
+            // we have real address now. Only new accepted tcp client has ce->ra == NULL.
+            else if ( ce->ra == NULL ) {
+                ce->ra = ra_get_or_create(raddr);
+                if ( ce->ra == NULL ) {
+                    tun_client_release(ce);
+                    return NULL;
+                }
+            }
+
+            // both raddr and ce-ra are not NULL. either udp or tcp already have data 
+			else if ( !is_sockaddr_equal(&ce->ra->real_addr, raddr) ) {
 				/* Real address changed, reassign a new entry for it. */
 				ra_put_no_free(ce->ra);
 				if ((ce->ra = ra_get_or_create(raddr)) == NULL) {
@@ -297,9 +423,13 @@ static struct tun_client *tun_client_get_or_create(
 					return NULL;
 				}
 			}
+
+            // else ce->ra->read_addr == raddr. Nothing to do.
+
 			return ce;
 		}
-	}
+
+	} // Iterate the list
 
 	/* Not found, always create new entry. */
 	if ((ce = malloc(sizeof(*ce))) == NULL) {
@@ -307,23 +437,38 @@ static struct tun_client *tun_client_get_or_create(
 				strerror(errno));
 		return NULL;
 	}
+    
+    ce->is_tcp = tcp_client_fd >= 0;
+    ce->client_fd = tcp_client_fd;
+    ce->tcp_read_buffer_len = 0;
 
 	ce->virt_addr = *vaddr;
 
-	/* Get real_addr entry before adding to list. */
-	if ((ce->ra = ra_get_or_create(raddr)) == NULL) {
-		free(ce);
-		return NULL;
-	}
+    if ( raddr == NULL ) {
+        ce->ra = NULL;
+    }
+    else {
+	    /* Get real_addr entry before adding to list. */
+	    if ((ce->ra = ra_get_or_create(raddr)) == NULL) {
+		    free(ce);
+		    return NULL;
+	    }
+    }
+
 	list_add_tail(&ce->list, chain);
 	va_map_len++;
 
-	inet_ntop(ce->virt_addr.af, &ce->virt_addr.in, s_virt_addr,
-			  sizeof(s_virt_addr));
-	inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
-			  s_real_addr, sizeof(s_real_addr));
-	printf("New virtual address [%s] at [%s:%u].\n", s_virt_addr, s_real_addr,
-			ntohs(port_of_sockaddr(&ce->ra->real_addr)));
+	inet_ntop(ce->virt_addr.af, &ce->virt_addr.in, s_virt_addr, sizeof(s_virt_addr));
+
+    if ( ce->ra != NULL ) {
+	    inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
+		    	  s_real_addr, sizeof(s_real_addr));
+	    printf("New virtual address [%s] at [%s:%u].\n", s_virt_addr, s_real_addr,
+		    	ntohs(port_of_sockaddr(&ce->ra->real_addr)));
+    }
+    else {
+	    printf("New virtual address [%s] tcp connection fd %d.\n", s_virt_addr, tcp_client_fd);
+    }
 
 	return ce;
 }
@@ -441,8 +586,53 @@ static inline void dest_addr_of_ipdata(
 	}
 }
 
-// This would get called when we have data to receive from a normal interface, i.e. from sockfd
-static int network_receiving(int tunfd, int sockfd)
+// TCP read non-blocking. Return 1 if whole netmsg is read, 0 if not all read, -1 if error
+static
+int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset, size_t whole_len)
+{
+    ssize_t read_size = 0;
+
+    size_t size_to_read = whole_len - *buffer_offset;
+    if ( size_to_read == 0 )
+       return 1;
+
+    do {        
+       read_size = read(client_fd, buffer + *buffer_offset, size_to_read);
+    } while ( read_size == -1 && errno == EINTR );
+    
+    if ( read_size > 0 ) {
+       *buffer_offset += read_size;
+       if ( *buffer_offset >= whole_len )
+          return 1;
+       else
+          return 0;
+    }
+
+    // EOF
+    if ( read_size == 0 )
+       return -1;
+
+    // Something not arrived
+    if ( read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) )
+       return 0;
+
+    // Other errors
+    fprintf(stderr, "read() on client fd %d failed %s\n", client_fd, strerror(errno));
+    return -1;
+}
+
+static
+void close_tcp_client(struct tun_client * tclient)
+{
+     assert(tclient->is_tcp && tclient->client_fd >= 0);
+     close(tclient->client_fd);
+     fprintf(stderr, "tun tcp client fd %d closed\n", tclient->client_fd);
+}
+
+// This handles packet from the client. i.e. It should be a netmsg.
+//
+// tclient == NULL: UDP
+static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
 	struct minivtun_msg *nmsg;
@@ -457,19 +647,81 @@ static int network_receiving(int tunfd, int sockfd)
 	socklen_t real_peer_alen;
 	struct iovec iov[2];
 	int rc;
+    int client_fd = -1;
 
-    // 1. Read a 'struct sockaddr_inx' from sockfd 
-	real_peer_alen = sizeof(real_peer);
-	rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
-			(struct sockaddr *)&real_peer, &real_peer_alen);
-	if (rc <= 0)
-		return 0;
+    // Receive the wrapped packet (netmsg)
+
+    // TCP
+    if ( tclient != NULL ) {
+       
+       assert(tclient->is_tcp);
+
+       // Read the length of netmsg (32bit BE)
+       uint32_t msg_len = 0;
+
+       int read_result = read_tcp_client_data(sockfd, tclient->tcp_read_buffer, 
+                                              &(tclient->tcp_read_buffer_len), sizeof(uint32_t));
+       // error
+       if ( read_result < 0 ) {
+          close_tcp_client(tclient);
+          if ( tclient->accepted_only )
+             tun_client_release_from_accepted(tclient);
+          else 
+             tun_client_release(tclient);
+          return -1;
+       }
+
+       // Next
+       if ( read_result == 0 )
+          return 0;
+
+       // We got netmsg length
+       msg_len = ntohs(*(uint32_t *)tclient->tcp_read_buffer);
+       tclient->tcp_read_buffer_len = 0; // reset read len
+       
+       // Read net_msg
+       read_result = read_tcp_client_data(sockfd, tclient->tcp_read_buffer, &tclient->tcp_read_buffer_len, 
+                                          msg_len);
+       if ( read_result < 0 ) {
+          close_tcp_client(tclient);
+          if ( tclient->accepted_only )
+             tun_client_release_from_accepted(tclient);
+          else 
+             tun_client_release(tclient);
+          return -1;
+       }
+
+       if ( read_result == 0 )
+          return 0;
+
+       // All read in.
+       memcpy(read_buffer, tclient->tcp_read_buffer, tclient->tcp_read_buffer_len);
+       rc = tclient->tcp_read_buffer_len;
+       tclient->tcp_read_buffer_len = 0;
+
+       // set real_peer & real_peer_alen
+       real_peer = tclient->ra->real_addr;
+       real_peer_alen = tclient->ra->real_addr.sa.sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+       client_fd = tclient->client_fd;
+
+       // Now tclient is useles
+       tun_client_release_from_accepted(tclient);
+    } 
+    // UDP
+    else {
+	    real_peer_alen = sizeof(real_peer);
+	    rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
+		        	(struct sockaddr *)&real_peer, &real_peer_alen);
+	    if (rc <= 0)
+		    return 0;
+    } // udp
 
 #if DEBUG
     printf("network_receiving: received %d bytes\n", rc);
 	hexdump(read_buffer, rc);
 #endif
 
+    // Decrypt payload. encrypted is in read_buffer, plain data is in nmsg, out_data(crypt_buffer) with length out_dlen
 	out_data = crypt_buffer;
 	out_dlen = (size_t)rc;
 	netmsg_to_local(read_buffer, &out_data, &out_dlen);
@@ -497,16 +749,20 @@ static int network_receiving(int tunfd, int sockfd)
 		}
 		if (out_dlen < MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive))
 			return 0;
-		if (is_valid_unicast_in(&nmsg->keepalive.loc_tun_in)) {
+        
+        struct in_addr inaddr = nmsg->keepalive.loc_tun_in;
+		if (is_valid_unicast_in(&inaddr)) {
 			virt_addr.af = AF_INET;
 			virt_addr.in = nmsg->keepalive.loc_tun_in;
-			if ((ce = tun_client_get_or_create(&virt_addr, &real_peer)))
+			if ((ce = tun_client_get_or_create(&virt_addr, &real_peer, client_fd)))
 				ce->last_recv = current_ts;
 		}
-		if (is_valid_unicast_in6(&nmsg->keepalive.loc_tun_in6)) {
+
+        struct in6_addr inaddr6 = nmsg->keepalive.loc_tun_in6;
+		if (is_valid_unicast_in6(&inaddr6)) {
 			virt_addr.af = AF_INET6;
 			virt_addr.in6 = nmsg->keepalive.loc_tun_in6;
-			if ((ce = tun_client_get_or_create(&virt_addr, &real_peer)))
+			if ((ce = tun_client_get_or_create(&virt_addr, &real_peer, client_fd)))
 				ce->last_recv = current_ts;
 		}
 		break;
@@ -532,16 +788,15 @@ static int network_receiving(int tunfd, int sockfd)
 		if (out_dlen - MINIVTUN_MSG_IPDATA_OFFSET < ip_dlen)
 			return 0;
 
+        // Copy source address  in ip packet to virt_addr.in
 		source_addr_of_ipdata(nmsg->ipdata.data, af, &virt_addr);
-		if ((ce = tun_client_get_or_create(&virt_addr, &real_peer)) == NULL)
+		if ((ce = tun_client_get_or_create(&virt_addr, &real_peer, client_fd)) == NULL)
 			return 0;
 
 		ce->last_recv = current_ts;
 		ce->ra->last_recv = current_ts;
 
-		//pi.flags = 0;
-		// pi.proto = nmsg->ipdata.proto;
-		//osx_ether_to_af(&pi.proto);
+        // tun required plain data
 		set_pi_with_ether_proto(&pi, ntohs(nmsg->ipdata.proto));
 		iov[0].iov_base = &pi;
 		iov[0].iov_len = sizeof(pi);
@@ -622,9 +877,11 @@ static int tunnel_receiving(int tunfd, int sockfd)
 		return 0;
 	}
 
+    // Copy destination address in incoming ip packet to virt_addr.addr_in or addr_in6
 	dest_addr_of_ipdata(pi + 1, af, &virt_addr);
 
 	if ((ce = tun_client_try_get(&virt_addr)) == NULL) {
+
 		/**
 		 * Not an existing client address, lookup the pseudo
 		 * route table for a destination to send.
@@ -644,15 +901,17 @@ static int tunnel_receiving(int tunfd, int sockfd)
 			if ((ce = tun_client_try_get(&__virt_addr)) == NULL)
 				return 0;
 
-			/* Finally, create the client entry. */
-			if ((ce = tun_client_get_or_create(&virt_addr,
-				&ce->ra->real_addr)) == NULL)
+			/* Finally, create the client entry. Using gateway's real address */
+			if ((ce = tun_client_get_or_create(&virt_addr, &ce->ra->real_addr, ce->is_tcp ? ce->client_fd : -1)) == NULL)
 				return 0;
 		} else {
 			return 0;
 		}
 	}
 
+    // Now ce contains the tun_client of the destination?
+
+    // Make netmsg
 	nmsg.hdr.opcode = MINIVTUN_MSG_IPDATA;
 	memset(nmsg.hdr.rsv, 0x0, sizeof(nmsg.hdr.rsv));
 	memcpy(nmsg.hdr.auth_key, config.crypto_key, sizeof(nmsg.hdr.auth_key));
@@ -672,15 +931,46 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	hexdump(out_data, out_dlen);
 #endif	
 
-	rc = (int)sendto(sockfd, out_data, out_dlen, 0,
-				(struct sockaddr *)&ce->ra->real_addr,
-				sizeof_sockaddr(&ce->ra->real_addr));
+    if ( ce->is_tcp && ce->client_fd >= 0 ) {
+
+        rc = write(ce->client_fd, out_data, out_dlen);
+
+    }
+    else {
+	    rc = (int)sendto(sockfd, out_data, out_dlen, 0,
+		    		(struct sockaddr *)&ce->ra->real_addr,
+			    	sizeof_sockaddr(&ce->ra->real_addr));
+    }
 	ce->last_xmit = current_ts;
 	ce->ra->last_xmit = current_ts;
 
 	return 0;
 }
 
+// Accept incoming TCP connection. Return -1 if error, otherwise the 
+static 
+int accept_connection(int listen_fd)
+{
+    struct sockaddr_inx addr_in; // real address
+    socklen_t addr_len = 0;   
+
+    int rv = accept(listen_fd, (struct sockaddr *)&addr_in, &addr_len);
+    if ( rv < 0 )
+       return rv;
+
+    set_nonblock(rv);
+
+    // We have real address, but don't know virtual address until first packet arrived.
+    if ( tun_client_create_accepted_only(&addr_in, rv) == NULL ) {
+       close(rv);
+       return -1;
+    }
+    
+    // return the client_fd;
+    return rv;
+}
+
+// The server's entry function
 int run_server(int tunfd, const char *loc_addr_pair)
 {
 	struct timeval timeo;
@@ -690,6 +980,9 @@ int run_server(int tunfd, const char *loc_addr_pair)
 	time_t last_walk;
 	char s_loc_addr[50];
 
+    int tcp_listen_fd = -1;
+
+    // 
 	if (get_sockaddr_inx_pair(loc_addr_pair, &loc_addr) < 0) {
 		fprintf(stderr, "*** Cannot resolve address pair '%s'.\n", loc_addr_pair);
 		return -1;
@@ -704,6 +997,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 	init_va_ra_maps();
 	hash_initval = (uint32_t)time(NULL);
 
+    // bind to UDP socket
 	if ((sockfd = socket(loc_addr.sa.sa_family, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
 		fprintf(stderr, "*** socket() failed: %s.\n", strerror(errno));
 		exit(1);
@@ -714,9 +1008,29 @@ int run_server(int tunfd, const char *loc_addr_pair)
 	}
 	set_nonblock(sockfd);
 
+    // Listen on TCP socket
+    tcp_listen_fd = socket(loc_addr.sa.sa_family, SOCK_STREAM, IPPROTO_TCP);
+    if ( tcp_listen_fd < 0 ) {
+        fprintf(stderr, "*** socket() to create tcp listening socket failed: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    // Bind to tcp listening socket
+    if ( bind(tcp_listen_fd, (struct sockaddr *)&loc_addr, sizeof_sockaddr(&loc_addr)) < 0 ) {
+        fprintf(stderr, "*** bind() to bind tcp listening socket failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    set_nonblock(tcp_listen_fd);
+
+    if ( listen(tcp_listen_fd, 128) < 0 ) {
+        fprintf(stderr, "*** listen() failed: %s\n", strerror(errno));
+        exit(1);
+    }
+
 	/* Run in background. */
 	if (config.in_background)
 		do_daemonize();
+
 	if (config.pid_file) {
 		FILE *fp;
 		if ((fp = fopen(config.pid_file, "w"))) {
@@ -727,16 +1041,21 @@ int run_server(int tunfd, const char *loc_addr_pair)
 
 	last_walk = time(NULL);
 
+    int max_fd = max_of(tunfd, sockfd);
+    max_fd = max_of(max_fd, tcp_listen_fd);
+
 	for (;;) {
+
 		FD_ZERO(&rset);
 		FD_SET(tunfd, &rset);
 		FD_SET(sockfd, &rset);
+        FD_SET(tcp_listen_fd, &rset);
 
 		timeo.tv_sec = 2;
 		timeo.tv_usec = 0;
 
-		rc = select((tunfd > sockfd ? tunfd : sockfd) + 1, &rset, NULL, NULL, &timeo);
-		if (rc < 0) {
+		rc = select(max_fd + 1, &rset, NULL, NULL, &timeo);
+		if ( rc < 0 && errno != EINTR ) {
 			fprintf(stderr, "*** select(): %s.\n", strerror(errno));
 			return -1;
 		}
@@ -744,14 +1063,60 @@ int run_server(int tunfd, const char *loc_addr_pair)
 		current_ts = time(NULL);
 
 		if (rc > 0) {
-			if (FD_ISSET(sockfd, &rset)) {
-				rc = network_receiving(tunfd, sockfd);
-			}
 
-			if (FD_ISSET(tunfd, &rset)) {
-				rc = tunnel_receiving(tunfd, sockfd);
+            // The udp socket to clients
+			if (FD_ISSET(sockfd, &rset)) {
+				rc = network_receiving(tunfd, sockfd, NULL);
 			}
-		}
+            // tun fd. The socket to receive outside packets
+			if (FD_ISSET(tunfd, &rset)) {
+				rc = tunnel_receiving(tunfd, sockfd); //
+			}
+            // tcp listen socket
+            if (FD_ISSET(tcp_listen_fd, &rset)) {
+                rc = accept_connection(tcp_listen_fd);
+                if (rc < 0) {
+                   fprintf(stderr, "accept() failed: %s\n", strerror(errno));                   
+                }
+                else {
+                   FD_SET(rc, &rset);
+                   max_fd = max_of(max_fd, rc);
+                }
+            }
+
+            // tcp client connections in accepted only list
+            struct tun_client *tclient, *temp;
+            list_for_each_entry_safe(tclient, temp, &tun_clients_accepted_only, list) {
+                 if ( FD_ISSET(tclient->client_fd, &rset) ) {
+                    int client_fd = tclient->client_fd;
+                    rc = network_receiving(tunfd, tclient->client_fd, tclient); 
+                    if ( rc < 0 ) {
+                        FD_CLR(client_fd, &rset);
+                    }
+                 }
+            }
+
+            // tcp client connections in tun_clients
+            for ( int i = 0; i < VA_MAP_HASH_SIZE; i++ ) {
+
+                struct list_head *chain = &va_map_hbase[i];
+                struct tun_client *ce;
+
+                list_for_each_entry (ce, chain, list) {
+                    if (ce->is_tcp) {
+                       if ( FD_ISSET(ce->client_fd, &rset) ) {
+                          int client_fd = ce->client_fd;
+                          rc = network_receiving(tunfd, ce->client_fd, ce);
+                          if ( rc < 0 ) {
+                             FD_CLR(client_fd, &rset);
+                          }
+                       }
+                    }
+                } // list
+
+            } // all vaddrs in va_map_base
+
+        } // if select() > 0
 
 		/* Check connection state at each chance. */
 		if (current_ts - last_walk >= 3) {

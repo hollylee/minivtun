@@ -32,6 +32,8 @@
 	const typeof(((type *)0)->member) * __mptr = (ptr);	\
 	(type *)((char *)__mptr - offsetof(type, member)); })
 
+#define max_of(v1, v2)   ((v1) > (v2) ? (v1) : (v2))
+
 #ifndef ETH_P_IP
 	#define ETH_P_IP 0x0800 /* Internet Protocol packet */
 #endif
