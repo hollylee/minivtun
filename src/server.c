@@ -676,7 +676,7 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient)
           return 0;
 
        // We got netmsg length
-       msg_len = ntohs(*(uint32_t *)tclient->tcp_read_buffer);
+       msg_len = ntohl(*(uint32_t *)tclient->tcp_read_buffer);
        tclient->tcp_read_buffer_len = 0; // reset read len
        
        // Read net_msg
@@ -933,7 +933,13 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
     if ( ce->is_tcp && ce->client_fd >= 0 ) {
 
-        rc = write(ce->client_fd, out_data, out_dlen);
+        uint32_t msg_len = htonl(out_dlen);
+        struct iovec iov[2];
+        iov[0].iov_base = &msg_len;
+        iov[0].iov_len = sizeof(uint32_t);
+        iov[1].iov_base = out_data;
+        iov[1].iov_len = out_dlen;
+        rc = writev(ce->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
 
     }
     else {
