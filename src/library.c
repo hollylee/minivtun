@@ -127,7 +127,7 @@ void fill_with_string_md5sum(const char *in, void *out, size_t outlen)
 	MD5_Final(out, &ctx);
 	*/
 #if OPENSSL_VERSION_NUMBER < 0x10100000L // < openssl 1.1.0
-    EVP_MD_CTX ctx_v, * ctx = &ctxv;
+    EVP_MD_CTX ctx_v, * ctx = &ctx_v;
     EVP_MD_CTX_init(ctx);
 #else
 	EVP_MD_CTX * ctx = EVP_MD_CTX_new();
@@ -137,7 +137,7 @@ void fill_with_string_md5sum(const char *in, void *out, size_t outlen)
 	EVP_DigestUpdate(ctx, in, strlen(in));
 	EVP_DigestFinal(ctx, out, &realOutLen);
 
-    #if OPENSSL_VERSION_NUMBER < 0x10100000L  // < 1.1.0
+#if OPENSSL_VERSION_NUMBER < 0x10100000L  // < 1.1.0
     EVP_MD_CTX_cleanup(ctx);
 #else        
 	EVP_MD_CTX_free(ctx);
