@@ -962,7 +962,7 @@ static
 int accept_connection(int listen_fd)
 {
     struct sockaddr_inx addr_in; // real address
-    socklen_t addr_len = 0;   
+    socklen_t addr_len = sizeof(addr_in);   
 
     int rv = accept(listen_fd, (struct sockaddr *)&addr_in, &addr_len);
     if ( rv < 0 )
