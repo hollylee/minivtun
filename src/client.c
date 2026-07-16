@@ -99,6 +99,51 @@ struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len,
 
 #ifndef __APPLE_NETWORK_EXTENSION__
 
+// return read size. < 0 if error
+static 
+int read_tcp_data_nonblocking(int fd, char * buffer, size_t * read_size, size_t total_size)
+{
+    assert(*read_size < total_size);
+
+    size_t size_to_read = total_size - *read_size;
+
+    ssize_t read_bytes = read(fd, buffer, size_to_read);
+    if ( read_bytes < 0 )
+       return -1;
+
+    if ( read_bytes == 0 )
+       return 0;
+
+    *read_size += read_bytes;
+    return read_bytes;
+}
+
+static
+int read_tcp_netmsg(int fd, char * buffer)
+{
+    size_t read_size = 0;
+
+    // Read netmsg length
+    do {
+       int rv = read_tcp_data_nonblocking(fd, buffer, &read_size, sizeof(uint32_t));       
+       if ( rv < 0 )
+          return rv;
+    } while (read_size < sizeof(uint32_t) );
+
+    uint32_t msg_len = ntohl(*(uint32_t *)buffer);
+
+    // Read netmsg
+    read_size = 0;
+
+    do {
+       int rv = read_tcp_data_nonblocking(fd, buffer, &read_size, msg_len);       
+       if ( rv < 0 )
+          return rv;
+    } while (read_size < msg_len);
+
+    return 0;
+}
+
 // Handling packets received from Internet.
 static int network_receiving(int tunfd, int sockfd)
 {
@@ -112,8 +157,13 @@ static int network_receiving(int tunfd, int sockfd)
 	struct iovec iov[2];
 	int rc;
 
-	real_peer_alen = sizeof(real_peer);
-	rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0, (struct sockaddr *)&real_peer, &real_peer_alen);
+    if ( config.use_tcp ) {
+        rc = read_tcp_netmsg(sockfd, read_buffer);
+    }
+    else {
+	    real_peer_alen = sizeof(real_peer);
+	    rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0, (struct sockaddr *)&real_peer, &real_peer_alen);
+    }
 
 #if DEBUG	
     printf("Read %d bytes from network\n", rc);
@@ -278,7 +328,19 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
     _tunnel_data_handler(pi+1, ip_dlen, proto, &out_data, &out_dlen);
 
-	rc = (int)send(sockfd, out_data, out_dlen, 0);
+    if ( config.use_tcp ) {
+        uint32_t msg_len = htonl(out_dlen);
+        struct iovec iov[2];
+        iov[0].iov_base = &msg_len;
+        iov[0].iov_len = sizeof(uint32_t);
+        iov[1].iov_base = out_data;
+        iov[1].iov_len = out_dlen;
+
+        rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
+    }
+    else {
+	    rc = (int)send(sockfd, out_data, out_dlen, 0);
+    }
 
 #if DEBUG
     printf("tunnel -> network: %zu bytes. Write to network returned %d\n", out_dlen, rc);
@@ -360,10 +422,19 @@ static int try_resolve_and_connect(const char *peer_addr_pair, struct sockaddr_i
 	if ((rc = get_sockaddr_inx_pair(peer_addr_pair, peer_addr)) < 0)
 		return rc;
 
-	if ((sockfd = socket(peer_addr->sa.sa_family, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
-		fprintf(stderr, "*** socket() failed: %s.\n", strerror(errno));
-		return -1;
-	}
+    if ( config.use_tcp ) {
+        sockfd = socket(peer_addr->sa.sa_family, SOCK_STREAM, IPPROTO_TCP);
+        if ( sockfd < 0 ) {
+		   fprintf(stderr, "*** socket(SOCK_STREAM) failed: %s.\n", strerror(errno));
+		   return -1;
+        }
+    }
+    else {
+	    if ((sockfd = socket(peer_addr->sa.sa_family, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
+		    fprintf(stderr, "*** socket(SOCK_DGRAM) failed: %s.\n", strerror(errno));
+		    return -1;
+	    }
+    }
 
     // Here, we should detect possible default interface/ip address changes and bind to 
 	// new address.
@@ -416,25 +487,34 @@ int run_client(int tunfd, const char *peer_addr_pair)
 	struct sockaddr_inx peer_addr;
 
 	if ((sockfd = try_resolve_and_connect(peer_addr_pair, &peer_addr)) >= 0) {
+
 		/* DNS resolve OK, start service normally. */
 		last_recv = time(NULL);
 		inet_ntop(peer_addr.sa.sa_family, addr_of_sockaddr(&peer_addr),
 				  s_peer_addr, sizeof(s_peer_addr));
 		printf("Mini virtual tunnelling client to %s:%u, interface: %s, bind to address %s\n",
 				s_peer_addr, ntohs(port_of_sockaddr(&peer_addr)), config.devname, config.bind_to_addr);
+
 	} else if (sockfd == -EAGAIN && config.wait_dns) {
+
 		/* Resolve later (last_recv = 0). */
 		last_recv = 0;
 		printf("Mini virtual tunnelling client, interface: %s. \n", config.devname);
 		printf("WARNING: Connection to '%s' temporarily unavailable, "
 			   "to be tried later.\n", peer_addr_pair);
+
 	} else if (sockfd == -EINVAL) {
+
 		fprintf(stderr, "*** Invalid address pair '%s'.\n", peer_addr_pair);
 		return -1;
+
 	}
+
 	else if ( sockfd == -EADDRNOTAVAIL ) {
+
 		fprintf(stderr, "*** Cannot bind to address '%s'.\n", config.bind_to_addr);
 		return -1;
+
 	} else {
 		fprintf(stderr, "*** Unable to connect to '%s'.\n", peer_addr_pair);
 		return -1;
@@ -471,6 +551,7 @@ int run_client(int tunfd, const char *peer_addr_pair)
 		}
 
 		current_ts = time(NULL);
+
 		if (last_recv > current_ts)
 			last_recv = current_ts;
 		if (last_keepalive > current_ts)
@@ -525,4 +606,4 @@ reconnect:
 	return 0;
 }
 
-#endif // __APPLE_NETWORK_EXTENSION__
+#endif // ! __APPLE_NETWORK_EXTENSION__

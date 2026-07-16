@@ -18,7 +18,7 @@ CFLAGS += -DDEBUG=1 -g
 endif
 
 minivtun: minivtun.o library.o server.o client.o client_route.o
-	$(CC) $(LDFLAGS) -o $@ $^ -lcrypto
+	$(CC) $(LDFLAGS) -o $@ $^
 
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c -o $@ $<
