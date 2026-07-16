@@ -519,6 +519,8 @@ int run_client(int tunfd, const char *peer_addr_pair)
 		return -1;
 	}
 
+    printf("Connected to server %s. sockfd %d\n", peer_addr_pair, sockfd);
+
 	/* Run in background. */
 	if (config.in_background)
 		do_daemonize();
@@ -564,10 +566,12 @@ int run_client(int tunfd, const char *peer_addr_pair)
 
 		/* Connection timed out, try reconnecting. */
 		if (current_ts - last_recv > config.reconnect_timeo) {
+
 reconnect:
 			/* Reopen the socket for a different local port. */
 			if (sockfd >= 0)
 				close(sockfd);
+
 			do {
 				if ((sockfd = try_resolve_and_connect(peer_addr_pair, &peer_addr)) < 0) {
 					fprintf(stderr, "Unable to connect to '%s', retrying.\n", peer_addr_pair);
@@ -580,7 +584,7 @@ reconnect:
 
 			inet_ntop(peer_addr.sa.sa_family, addr_of_sockaddr(&peer_addr), s_peer_addr,
 					  sizeof(s_peer_addr));
-			printf("Reconnected to %s:%u.\n", s_peer_addr, ntohs(port_of_sockaddr(&peer_addr)));
+			printf("Reconnected to %s:%u. socket %d\n", s_peer_addr, ntohs(port_of_sockaddr(&peer_addr)), sockfd);
 			continue;
 		}
 
