@@ -338,6 +338,11 @@ static int tunnel_receiving(int tunfd, int sockfd)
         iov[1].iov_len = out_dlen;
 
         rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
+
+#if DEBUG
+        printf("write msg_len %u(0x%x) to network\n", msg_len, msg_len);
+#endif
+
     }
     else {
 	    rc = (int)send(sockfd, out_data, out_dlen, 0);

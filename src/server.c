@@ -1051,9 +1051,6 @@ int run_server(int tunfd, const char *loc_addr_pair)
 
 	last_walk = time(NULL);
 
-    int max_fd = max_of(tunfd, sockfd);
-    max_fd = max_of(max_fd, tcp_listen_fd);
-
 	for (;;) {
 
 		FD_ZERO(&rset);
@@ -1061,10 +1058,14 @@ int run_server(int tunfd, const char *loc_addr_pair)
 		FD_SET(sockfd, &rset);
         FD_SET(tcp_listen_fd, &rset);
 
+        int max_fd = max_of(tunfd, sockfd);
+        max_fd = max_of(max_fd, tcp_listen_fd);
+
         // client fds in accepted only list
         struct tun_client *tclient;
         list_for_each_entry(tclient, &tun_clients_accepted_only, list) {
             FD_SET(tclient->client_fd, &rset);
+            max_fd = max_of(max_fd, tclient->client_fd);
         }
 
         // tcp client connections in tun_clients
@@ -1074,8 +1075,10 @@ int run_server(int tunfd, const char *loc_addr_pair)
             struct tun_client *ce;
 
             list_for_each_entry (ce, chain, list) {
-                if (ce->is_tcp)
+                if (ce->is_tcp) {
                    FD_SET(ce->client_fd, &rset);
+                   max_fd = max_of(max_fd, tclient->client_fd);
+                }
             }
         } // list
 
@@ -1104,14 +1107,12 @@ int run_server(int tunfd, const char *loc_addr_pair)
             if (FD_ISSET(tcp_listen_fd, &rset)) {
                 rc = accept_connection(tcp_listen_fd);
                 if (rc < 0) {
-                   fprintf(stderr, "accept() failed: %s\n", strerror(errno));                   
+                   fprintf(stderr, "accept() failed: %s\n", strerror(errno));
                 }
                 else {
-                   FD_SET(rc, &rset);
-                   max_fd = max_of(max_fd, rc);
 #if DEBUG                   
-                   fprintf(stderr, "accepted client connection fd = %d, mac_fd = %d, accepted_only_len %u\n", 
-                           rc, max_fd, tun_clients_accepted_only_len);
+                   fprintf(stderr, "accepted client connection fd = %d, accepted_only_len %u\n", 
+                           rc, tun_clients_accepted_only_len);
 #endif                           
                 }
             }
