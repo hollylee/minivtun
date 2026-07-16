@@ -679,6 +679,9 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient)
        msg_len = ntohl(*(uint32_t *)tclient->tcp_read_buffer);
        tclient->tcp_read_buffer_len = 0; // reset read len
        
+#if DEBUG
+    printf("network_receiving: received msg_len %d (0x%x)\n", msg_len, msg_len);
+#endif
        // Read net_msg
        read_result = read_tcp_client_data(sockfd, tclient->tcp_read_buffer, &tclient->tcp_read_buffer_len, 
                                           msg_len);
@@ -940,13 +943,14 @@ static int tunnel_receiving(int tunfd, int sockfd)
         iov[1].iov_base = out_data;
         iov[1].iov_len = out_dlen;
         rc = writev(ce->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
-
+        
     }
     else {
 	    rc = (int)sendto(sockfd, out_data, out_dlen, 0,
 		    		(struct sockaddr *)&ce->ra->real_addr,
 			    	sizeof_sockaddr(&ce->ra->real_addr));
     }
+
 	ce->last_xmit = current_ts;
 	ce->ra->last_xmit = current_ts;
 

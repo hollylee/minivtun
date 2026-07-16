@@ -166,7 +166,8 @@ static int network_receiving(int tunfd, int sockfd)
     }
 
 #if DEBUG	
-    printf("Read %d bytes from network\n", rc);
+    printf("network receiving: Read %d bytes from network\n", rc);
+    hexdump(read_buffer, rc);
 #endif
 
 	if (rc <= 0)
@@ -344,9 +345,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
 #if DEBUG
     printf("tunnel -> network: %zu bytes. Write to network returned %d\n", out_dlen, rc);
-	for ( int i = 0; i < out_dlen; i++ )
-	    printf("0x%x, ", ((char *)out_data)[i]);
-	printf("\n");
+    hexdump(out_data, out_dlen);
 #endif	
 
 
