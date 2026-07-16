@@ -1054,15 +1054,33 @@ int run_server(int tunfd, const char *loc_addr_pair)
     int max_fd = max_of(tunfd, sockfd);
     max_fd = max_of(max_fd, tcp_listen_fd);
 
+	for (;;) {
+
 		FD_ZERO(&rset);
 		FD_SET(tunfd, &rset);
 		FD_SET(sockfd, &rset);
         FD_SET(tcp_listen_fd, &rset);
 
+        // client fds in accepted only list
+        struct tun_client *tclient;
+        list_for_each_entry(tclient, &tun_clients_accepted_only, list) {
+            FD_SET(tclient->client_fd, &rset);
+        }
+
+        // tcp client connections in tun_clients
+        for ( int i = 0; i < VA_MAP_HASH_SIZE; i++ ) {
+
+            struct list_head *chain = &va_map_hbase[i];
+            struct tun_client *ce;
+
+            list_for_each_entry (ce, chain, list) {
+                if (ce->is_tcp)
+                   FD_SET(ce->client_fd, &rset);
+            }
+        } // list
+
 		timeo.tv_sec = 2;
 		timeo.tv_usec = 0;
-
-	for (;;) {
 
 		rc = select(max_fd + 1, &rset, NULL, NULL, &timeo);
 		if ( rc < 0 && errno != EINTR ) {
