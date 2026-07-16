@@ -1054,8 +1054,6 @@ int run_server(int tunfd, const char *loc_addr_pair)
     int max_fd = max_of(tunfd, sockfd);
     max_fd = max_of(max_fd, tcp_listen_fd);
 
-	for (;;) {
-
 		FD_ZERO(&rset);
 		FD_SET(tunfd, &rset);
 		FD_SET(sockfd, &rset);
@@ -1063,6 +1061,8 @@ int run_server(int tunfd, const char *loc_addr_pair)
 
 		timeo.tv_sec = 2;
 		timeo.tv_usec = 0;
+
+	for (;;) {
 
 		rc = select(max_fd + 1, &rset, NULL, NULL, &timeo);
 		if ( rc < 0 && errno != EINTR ) {
@@ -1092,7 +1092,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
                    FD_SET(rc, &rset);
                    max_fd = max_of(max_fd, rc);
 #if DEBUG                   
-                   fprintf(stderr, "accepted client connection fd = %d, mac_fd = %d, accepted_only_len %zu\n", 
+                   fprintf(stderr, "accepted client connection fd = %d, mac_fd = %d, accepted_only_len %u\n", 
                            rc, max_fd, tun_clients_accepted_only_len);
 #endif                           
                 }
