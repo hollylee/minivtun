@@ -252,7 +252,7 @@ int main(int argc, char *argv[])
 	char cmd[128];
 	int tunfd, opt;
 
-	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:b:dwhf",
+	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:b:dwhfT",
 			long_opts, NULL)) != -1) {
 
 		switch (opt) {

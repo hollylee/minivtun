@@ -1091,6 +1091,10 @@ int run_server(int tunfd, const char *loc_addr_pair)
                 else {
                    FD_SET(rc, &rset);
                    max_fd = max_of(max_fd, rc);
+#if DEBUG                   
+                   fprintf(stderr, "accepted client connection fd = %d, mac_fd = %d, accepted_only_len %zu\n", 
+                           rc, max_fd, tun_clients_accepted_only_len);
+#endif                           
                 }
             }
 
@@ -1098,9 +1102,15 @@ int run_server(int tunfd, const char *loc_addr_pair)
             struct tun_client *tclient, *temp;
             list_for_each_entry_safe(tclient, temp, &tun_clients_accepted_only, list) {
                  if ( FD_ISSET(tclient->client_fd, &rset) ) {
+#if DEBUG
+                    fprintf(stderr, "accepted client fd %d ready to read\n", tclient->client_fd);
+#endif                    
                     int client_fd = tclient->client_fd;
                     rc = network_receiving(tunfd, tclient->client_fd, tclient); 
                     if ( rc < 0 ) {
+#if DEBUG
+                        fprintf(stderr, "accepted client fd %d network receiving failed. Clear\n", tclient->client_fd);
+#endif                    
                         FD_CLR(client_fd, &rset);
                     }
                  }
@@ -1115,9 +1125,15 @@ int run_server(int tunfd, const char *loc_addr_pair)
                 list_for_each_entry (ce, chain, list) {
                     if (ce->is_tcp) {
                        if ( FD_ISSET(ce->client_fd, &rset) ) {
+#if DEBUG
+                          fprintf(stderr, "connected client fd %d ready to read\n", tclient->client_fd);
+#endif                    
                           int client_fd = ce->client_fd;
                           rc = network_receiving(tunfd, ce->client_fd, ce);
                           if ( rc < 0 ) {
+#if DEBUG
+                             fprintf(stderr, "connected client fd %d network receiving failed. Clear\n", tclient->client_fd);
+#endif                    
                              FD_CLR(client_fd, &rset);
                           }
                        }
