@@ -551,7 +551,7 @@ static void va_ra_walk_continue(int sockfd)
 		} while (ra_count < ra_walk_max && ra_index != __ra_index);
 	}
 
-	printf("Online clients: %u, addresses: %u\n", ra_set_len, va_map_len);
+	printf("Online clients: %u, addresses: %u, accept only: %u\n", ra_set_len, va_map_len, tun_clients_accepted_only_len);
 }
 
 static inline void source_addr_of_ipdata(
@@ -602,19 +602,27 @@ int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset
     
     if ( read_size > 0 ) {
        *buffer_offset += read_size;
-       if ( *buffer_offset >= whole_len )
+       if ( *buffer_offset >= whole_len ) {
+          fprintf(stderr, "client fd %d read %zd bytes. offset %zu whole %zu. All read in\n", client_fd, read_size, *buffer_offset, whole_len);
           return 1;
-       else
+       }
+       else {
+          fprintf(stderr, "client fd %d read %zd bytes. offset %zu whole %zu. more data\n", client_fd, read_size, *buffer_offset, whole_len);
           return 0;
+       }
     }
 
     // EOF
-    if ( read_size == 0 )
+    if ( read_size == 0 ) {
+       fprintf(stderr, "read() on client fd %d EOF (peer disconnected)\n", client_fd);
        return -1;
+    }
 
     // Something not arrived
-    if ( read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) )
+    if ( read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
+       fprintf(stderr, "read() on client fd %d read_size %zd (errno %d), more data.\n", client_fd, read_size, errno);       
        return 0;
+    }
 
     // Other errors
     fprintf(stderr, "read() on client fd %d failed %s\n", client_fd, strerror(errno));
