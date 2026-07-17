@@ -1145,13 +1145,13 @@ int run_server(int tunfd, const char *loc_addr_pair)
                     if (ce->is_tcp) {
                        if ( FD_ISSET(ce->client_fd, &rset) ) {
 #if DEBUG
-                          fprintf(stderr, "connected client fd %d ready to read\n", tclient->client_fd);
+                          fprintf(stderr, "connected client fd %d ready to read\n", ce->client_fd);
 #endif                    
                           int client_fd = ce->client_fd;
                           rc = network_receiving(tunfd, ce->client_fd, ce);
                           if ( rc < 0 ) {
 #if DEBUG
-                             fprintf(stderr, "connected client fd %d network receiving failed. Clear\n", tclient->client_fd);
+                             fprintf(stderr, "connected client fd %d network receiving failed. Clear\n", ce->client_fd);
 #endif                    
                              FD_CLR(client_fd, &rset);
                           }

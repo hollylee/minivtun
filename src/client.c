@@ -336,7 +336,21 @@ static int tunnel_receiving(int tunfd, int sockfd)
         inet_ntop(AF_INET, &to_ip, to_addr, INET_ADDRSTRLEN + 1);
 
         printf("Read %d bytes from tunnel. from %s to %s\n", rc, from_addr, to_addr);
-        
+
+    }
+    else if ( proto == ETH_P_IPV6 ) {
+
+        // IP v6: source addr: offset 12. destination addr: offset 16
+        char from_addr[INET6_ADDRSTRLEN + 1] = { 0 };
+        uint8_t * from_ip = (uint8_t *)(pi + 1) + 8;
+        inet_ntop(AF_INET6, from_ip, from_addr, INET6_ADDRSTRLEN + 1);
+
+        char to_addr[INET6_ADDRSTRLEN + 1] = { 0 };
+        uint8_t * to_ip = (uint8_t *)(pi + 1) + 24;
+        inet_ntop(AF_INET, to_ip, to_addr, INET6_ADDRSTRLEN + 1);
+
+        printf("Read %d bytes from tunnel. from %s to %s\n", rc, from_addr, to_addr);
+
     }
 #endif
 
