@@ -324,7 +324,20 @@ static int tunnel_receiving(int tunfd, int sockfd)
     out_data = crypt_buffer;
 
 #if DEBUG
-    printf("Read %d bytes from tunnel\n", rc);
+    if ( proto == ETH_P_IP ) {
+
+        // IP v4: source addr: offset 12. destination addr: offset 16
+        char from_addr[INET_ADDRSTRLEN + 1] = { 0 };
+        uint32_t from_ip = *(uint32_t *)((uint8_t *)(pi + 1) + 12);
+        inet_ntop(AF_INET, &from_ip, from_addr, INET_ADDRSTRLEN + 1);
+
+        char to_addr[INET_ADDRSTRLEN + 1] = { 0 };
+        uint32_t to_ip = *(uint32_t *)((uint8_t *)(pi + 1) + 16);
+        inet_ntop(AF_INET, &to_ip, to_addr, INET_ADDRSTRLEN + 1);
+
+        printf("Read %d bytes from tunnel. from %s to %s\n", rc, from_addr, to_addr);
+        
+    }
 #endif
 
     _tunnel_data_handler(pi+1, ip_dlen, proto, &out_data, &out_dlen);
@@ -341,6 +354,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
 #if DEBUG
         printf("write msg_len %u(0x%x) to network\n", msg_len, msg_len);
+        hexdump(&msg_len, sizeof(uint32_t));
 #endif
 
     }
@@ -407,8 +421,19 @@ static int peer_keepalive(int sockfd)
 
     _keepalive_make(&out_msg, &out_len);
 
-	
-	rc = (int)send(sockfd, out_msg, out_len, 0);
+	if ( config.use_tcp ) {
+        uint32_t msg_len = htonl(out_len);
+        struct iovec iov[2];
+        iov[0].iov_len = sizeof(uint32_t);
+        iov[0].iov_base = &msg_len;
+        iov[1].iov_len = out_len;
+        iov[1].iov_base = out_msg;
+
+        rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
+    }
+    else {
+	    rc = (int)send(sockfd, out_msg, out_len, 0);
+    }
 
 	/* Update 'last_keepalive' only when it's really sent out. */
 	if (rc > 0) {
