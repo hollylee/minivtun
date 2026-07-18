@@ -725,8 +725,9 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient)
        real_peer_alen = tclient->ra->real_addr.sa.sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
        client_fd = tclient->client_fd;
 
-       // Now tclient is useless.
-       tun_client_release_from_accepted(tclient);
+       // 
+       if ( tclient->accepted_only )
+          tun_client_release_from_accepted(tclient);
     } 
     // UDP
     else {
