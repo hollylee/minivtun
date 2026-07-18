@@ -152,7 +152,7 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa)
 
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
 			  s_real_addr, sizeof(s_real_addr));
-	printf("New client [%s:%u]\n", s_real_addr, port_of_sockaddr(&re->real_addr));
+	printf("New client [%s:%u]\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)));
 
 	return re;
 }
@@ -341,7 +341,7 @@ static inline void tun_client_release_from_accepted(struct tun_client *ce)
 {
     assert(ce->accepted_only && ce->is_tcp && ce->client_fd >= 0);
 
-	char s_real_addr[50] = { 0 };
+	char s_real_addr[INET6_ADDRSTRLEN + 1] = { 0 };
 
     inet_ntop(ce->ra->real_addr.sa.sa_family, addr_of_sockaddr(&ce->ra->real_addr),
 	    	  s_real_addr, sizeof(s_real_addr));
@@ -495,6 +495,7 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	local_to_netmsg(nmsg, &out_msg, &out_len);
 
+    printf("ra_entry_keepalive\n");
 	rc = (int)sendto(sockfd, out_msg, out_len, 0, (struct sockaddr *)&re->real_addr,
 				sizeof_sockaddr(&re->real_addr));
 
@@ -620,7 +621,16 @@ int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset
 
     // Something not arrived
     if ( read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
-       fprintf(stderr, "read() on client fd %d read_size %zd (errno %d), more data.\n", client_fd, read_size, errno);       
+
+       // Data not ready? in FIN?
+       int socket_error = 0;
+       socklen_t socket_error_len = sizeof(int);
+       getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len);
+       
+       //
+       fprintf(stderr, "read() on client fd %d read_size %zd (errno %d), getsockopt get error %d, more data?\n", 
+               client_fd, read_size, errno, socket_error);       
+
        return 0;
     }
 
@@ -715,7 +725,7 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient)
        real_peer_alen = tclient->ra->real_addr.sa.sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
        client_fd = tclient->client_fd;
 
-       // Now tclient is useles
+       // Now tclient is useless.
        tun_client_release_from_accepted(tclient);
     } 
     // UDP
@@ -728,7 +738,9 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient)
     } // udp
 
 #if DEBUG
-    printf("network_receiving: received %d bytes\n", rc);
+    char real_peer_str[INET6_ADDRSTRLEN + 1] = { 0 };
+    inet_ntop(real_peer.sa.sa_family, &real_peer, real_peer_str, INET6_ADDRSTRLEN);
+    printf("network_receiving: received %d bytes. [%s:%d]\n", rc, real_peer_str, port_of_sockaddr(&real_peer));
 	hexdump(read_buffer, rc);
 #endif
 

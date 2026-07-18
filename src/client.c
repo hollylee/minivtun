@@ -340,14 +340,14 @@ static int tunnel_receiving(int tunfd, int sockfd)
     }
     else if ( proto == ETH_P_IPV6 ) {
 
-        // IP v6: source addr: offset 12. destination addr: offset 16
+        // IP v6: source addr: offset 8. destination addr: offset 24
         char from_addr[INET6_ADDRSTRLEN + 1] = { 0 };
         uint8_t * from_ip = (uint8_t *)(pi + 1) + 8;
         inet_ntop(AF_INET6, from_ip, from_addr, INET6_ADDRSTRLEN + 1);
 
         char to_addr[INET6_ADDRSTRLEN + 1] = { 0 };
         uint8_t * to_ip = (uint8_t *)(pi + 1) + 24;
-        inet_ntop(AF_INET, to_ip, to_addr, INET6_ADDRSTRLEN + 1);
+        inet_ntop(AF_INET6, to_ip, to_addr, INET6_ADDRSTRLEN + 1);
 
         printf("Read %d bytes from tunnel. from %s to %s\n", rc, from_addr, to_addr);
 
@@ -604,8 +604,10 @@ int run_client(int tunfd, const char *peer_addr_pair)
 
 		/* Packet transmission timed out, send keep-alive packet. */
 		if (current_ts - last_keepalive > config.keepalive_timeo) {
-			if (sockfd >= 0)
-				peer_keepalive(sockfd);
+			if (sockfd >= 0) {                
+				int rv = peer_keepalive(sockfd);
+            }
+
 		}
 
 		/* Connection timed out, try reconnecting. */
