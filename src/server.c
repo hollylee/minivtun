@@ -1171,9 +1171,9 @@ int run_server(int tunfd, const char *loc_addr_pair)
             for ( int i = 0; i < VA_MAP_HASH_SIZE; i++ ) {
 
                 struct list_head *chain = &va_map_hbase[i];
-                struct tun_client *ce;
+                struct tun_client *ce, *temp;
 
-                list_for_each_entry (ce, chain, list) {
+                list_for_each_entry_safe (ce, temp, chain, list) {
                     if (ce->is_tcp) {
                        if ( FD_ISSET(ce->client_fd, &rset) ) {
 #if DEBUG
