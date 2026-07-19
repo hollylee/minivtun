@@ -473,6 +473,15 @@ static struct tun_client *tun_client_get_or_create(
 	return ce;
 }
 
+static
+void close_tcp_client(struct tun_client * tclient)
+{
+     assert(tclient->is_tcp && tclient->client_fd >= 0);
+     close(tclient->client_fd);
+     fprintf(stderr, "tun tcp client fd %d closed\n", tclient->client_fd);
+}
+
+
 /**
  * Send keep-alive packet to the corresponding client
  * with information stored in 're'.
@@ -495,7 +504,10 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	local_to_netmsg(nmsg, &out_msg, &out_len);
 
-    printf("ra_entry_keepalive\n");
+#if DEBUG
+    printf("ra_entry_keepalive sockfd %d\n", sockfd);
+#endif
+
 	rc = (int)sendto(sockfd, out_msg, out_len, 0, (struct sockaddr *)&re->real_addr,
 				sizeof_sockaddr(&re->real_addr));
 
@@ -527,6 +539,10 @@ static void va_ra_walk_continue(int sockfd)
 			list_for_each_entry_safe (ce, __ce, &va_map_hbase[va_index], list) {
 				//tun_client_dump(ce);
 				if (current_ts - ce->last_recv > config.reconnect_timeo) {
+
+                    if ( ce->is_tcp ) // TCP requires it
+                       close_tcp_client(ce);
+
 					tun_client_release(ce);
 				}
 				va_count++;
@@ -639,14 +655,6 @@ int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset
     return -1;
 }
 
-static
-void close_tcp_client(struct tun_client * tclient)
-{
-     assert(tclient->is_tcp && tclient->client_fd >= 0);
-     close(tclient->client_fd);
-     fprintf(stderr, "tun tcp client fd %d closed\n", tclient->client_fd);
-}
-
 // This handles packet from the client. i.e. It should be a netmsg.
 //
 // tclient == NULL: UDP
@@ -740,7 +748,7 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient)
 
 #if DEBUG
     char real_peer_str[INET6_ADDRSTRLEN + 1] = { 0 };
-    inet_ntop(real_peer.sa.sa_family, &real_peer, real_peer_str, INET6_ADDRSTRLEN);
+    inet_ntop(real_peer.sa.sa_family, addr_of_sockaddr(&real_peer), real_peer_str, INET6_ADDRSTRLEN);
     printf("network_receiving: received %d bytes. [%s:%d]\n", rc, real_peer_str, port_of_sockaddr(&real_peer));
 	hexdump(read_buffer, rc);
 #endif
@@ -1113,6 +1121,9 @@ int run_server(int tunfd, const char *loc_addr_pair)
 		}
 
 		current_ts = time(NULL);
+#if DEBUG
+        printf("current_ts = %ld\n", current_ts);
+#endif        
 
 		if (rc > 0) {
 
