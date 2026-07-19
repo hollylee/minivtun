@@ -1095,6 +1095,9 @@ int run_server(int tunfd, const char *loc_addr_pair)
         list_for_each_entry(tclient, &tun_clients_accepted_only, list) {
             FD_SET(tclient->client_fd, &rset);
             max_fd = max_of(max_fd, tclient->client_fd);
+#if DEBUG            
+            fprintf(stderr, "Accepted only: add fd %d to set. max fd is %d", tclient->client_fd, max_fd);
+#endif
         }
 
         // tcp client connections in tun_clients
@@ -1107,6 +1110,9 @@ int run_server(int tunfd, const char *loc_addr_pair)
                 if (ce->is_tcp) {
                    FD_SET(ce->client_fd, &rset);
                    max_fd = max_of(max_fd, tclient->client_fd);
+#if DEBUG            
+            fprintf(stderr, "Conncted client: add fd %d to set. max fd is %d", ce->client_fd, max_fd);
+#endif
                 }
             }
         } // list
@@ -1160,9 +1166,9 @@ int run_server(int tunfd, const char *loc_addr_pair)
                     rc = network_receiving(tunfd, tclient->client_fd, tclient); 
                     if ( rc < 0 ) {
 #if DEBUG
-                        fprintf(stderr, "accepted client fd %d network receiving failed. Clear\n", client_fd);
+                        fprintf(stderr, "accepted client fd %d network receiving failed.\n", client_fd);
 #endif                    
-                        FD_CLR(client_fd, &rset);
+                        // FD_CLR(client_fd, &rset);
                     }
                  }
             }
@@ -1180,12 +1186,12 @@ int run_server(int tunfd, const char *loc_addr_pair)
                           fprintf(stderr, "connected client fd %d ready to read\n", ce->client_fd);
 #endif                    
                           int client_fd = ce->client_fd;
-                          rc = network_receiving(tunfd, ce->client_fd, ce);
+                          rc = network_receiving(tunfd, client_fd, ce);
                           if ( rc < 0 ) {
 #if DEBUG
-                             fprintf(stderr, "connected client fd %d network receiving failed. Clear\n", ce->client_fd);
+                             fprintf(stderr, "connected client fd %d network receiving failed. Clear\n", client_fd);
 #endif                    
-                             FD_CLR(client_fd, &rset);
+                             // FD_CLR(client_fd, &rset);
                           }
                        }
                     }
