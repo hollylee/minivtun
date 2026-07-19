@@ -1091,13 +1091,15 @@ int run_server(int tunfd, const char *loc_addr_pair)
         max_fd = max_of(max_fd, tcp_listen_fd);
 
         // client fds in accepted only list
-        struct tun_client *tclient;
-        list_for_each_entry(tclient, &tun_clients_accepted_only, list) {
-            FD_SET(tclient->client_fd, &rset);
-            max_fd = max_of(max_fd, tclient->client_fd);
+        {
+            struct tun_client *tclient;
+            list_for_each_entry(tclient, &tun_clients_accepted_only, list) {
+                FD_SET(tclient->client_fd, &rset);
+                max_fd = max_of(max_fd, tclient->client_fd);
 #if DEBUG            
-            fprintf(stderr, "Accepted only: add fd %d to set. max fd is %d", tclient->client_fd, max_fd);
+                fprintf(stderr, "Accepted only: add fd %d to set. max fd is %d\n", tclient->client_fd, max_fd);
 #endif
+            }
         }
 
         // tcp client connections in tun_clients
@@ -1109,9 +1111,9 @@ int run_server(int tunfd, const char *loc_addr_pair)
             list_for_each_entry (ce, chain, list) {
                 if (ce->is_tcp) {
                    FD_SET(ce->client_fd, &rset);
-                   max_fd = max_of(max_fd, tclient->client_fd);
+                   max_fd = max_of(max_fd, ce->client_fd);
 #if DEBUG            
-            fprintf(stderr, "Conncted client: add fd %d to set. max fd is %d", ce->client_fd, max_fd);
+            fprintf(stderr, "Conncted client: add fd %d to set. max fd is %d\n", ce->client_fd, max_fd);
 #endif
                 }
             }
