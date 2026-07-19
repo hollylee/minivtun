@@ -1160,7 +1160,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
                     rc = network_receiving(tunfd, tclient->client_fd, tclient); 
                     if ( rc < 0 ) {
 #if DEBUG
-                        fprintf(stderr, "accepted client fd %d network receiving failed. Clear\n", tclient->client_fd);
+                        fprintf(stderr, "accepted client fd %d network receiving failed. Clear\n", client_fd);
 #endif                    
                         FD_CLR(client_fd, &rset);
                     }
