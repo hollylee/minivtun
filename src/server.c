@@ -1113,7 +1113,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
                    FD_SET(ce->client_fd, &rset);
                    max_fd = max_of(max_fd, ce->client_fd);
 #if DEBUG            
-            fprintf(stderr, "Conncted client: add fd %d to set. max fd is %d\n", ce->client_fd, max_fd);
+            fprintf(stderr, "Connected client: add fd %d to set. max fd is %d\n", ce->client_fd, max_fd);
 #endif
                 }
             }
@@ -1157,24 +1157,6 @@ int run_server(int tunfd, const char *loc_addr_pair)
                 }
             }
 
-            // tcp client connections in accepted only list
-            struct tun_client *tclient, *temp;
-            list_for_each_entry_safe(tclient, temp, &tun_clients_accepted_only, list) {
-                 if ( FD_ISSET(tclient->client_fd, &rset) ) {
-#if DEBUG
-                    fprintf(stderr, "accepted client fd %d ready to read\n", tclient->client_fd);
-#endif                    
-                    int client_fd = tclient->client_fd;
-                    rc = network_receiving(tunfd, tclient->client_fd, tclient); 
-                    if ( rc < 0 ) {
-#if DEBUG
-                        fprintf(stderr, "accepted client fd %d network receiving failed.\n", client_fd);
-#endif                    
-                        // FD_CLR(client_fd, &rset);
-                    }
-                 }
-            }
-
             // tcp client connections in tun_clients
             for ( int i = 0; i < VA_MAP_HASH_SIZE; i++ ) {
 
@@ -1200,6 +1182,24 @@ int run_server(int tunfd, const char *loc_addr_pair)
                 } // list
 
             } // all vaddrs in va_map_base
+
+            // tcp client connections in accepted only list
+            struct tun_client *tclient, *temp;
+            list_for_each_entry_safe(tclient, temp, &tun_clients_accepted_only, list) {
+                 if ( FD_ISSET(tclient->client_fd, &rset) ) {
+#if DEBUG
+                    fprintf(stderr, "accepted client fd %d ready to read\n", tclient->client_fd);
+#endif                    
+                    int client_fd = tclient->client_fd;
+                    rc = network_receiving(tunfd, tclient->client_fd, tclient); 
+                    if ( rc < 0 ) {
+#if DEBUG
+                        fprintf(stderr, "accepted client fd %d network receiving failed.\n", client_fd);
+#endif                    
+                        // FD_CLR(client_fd, &rset);
+                    }
+                 }
+            }
 
         } // if select() > 0
 
