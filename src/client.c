@@ -20,10 +20,10 @@
 #include <netinet/in.h>
 
 #include "minivtun.h"
-#include "client_route.h"
 
 #if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
   #include "client_route.h"
+  #include "list.h"
 #endif
 
 static time_t last_recv = 0, last_keepalive = 0, current_ts = 0;
@@ -97,9 +97,9 @@ struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len,
 }
 
 
-#ifndef __APPLE_NETWORK_EXTENSION__
+#if !defined(__APPLE_NETWORK_EXTENSION__) || !defined(__ANDROID_VPN_SERVICE__)
 
-// return read size. < 0 if error
+// return read size in this call. < 0 if error (including EOF). *read_size returned total read size in this batch.
 static 
 int read_tcp_data_nonblocking(int fd, char * buffer, size_t * read_size, size_t total_size)
 {
@@ -107,44 +107,130 @@ int read_tcp_data_nonblocking(int fd, char * buffer, size_t * read_size, size_t 
 
     size_t size_to_read = total_size - *read_size;
 
-    ssize_t read_bytes = read(fd, buffer, size_to_read);
-    if ( read_bytes < 0 )
-       return -1;
+    ssize_t read_bytes = 0;
+    do {
+       read_bytes = read(fd, buffer, size_to_read);
+    } while ( read_bytes < 0 && errno == EINTR );
 
-    if ( read_bytes == 0 )
+    if ( read_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) )
        return 0;
+
+    if ( read_bytes < 0 ) {
+#if DEBUG
+       fprintf(stderr, "Error reading from fd %d, error %s\n", fd, strerror(errno));
+#endif        
+       return -1;
+    }
+
+    // EOF
+    if ( read_bytes == 0 ) {
+#if DEBUG
+       fprintf(stderr, "EOF reading from fd %d\n", fd);
+#endif        
+       return -1;
+    }
 
     *read_size += read_bytes;
     return read_bytes;
 }
 
+// Write buffer queue for nonblocking writing
+static __LIST_HEAD(write_buffer_list);
+
+struct write_buffer_entry {
+    struct list_head list;
+    char * buffer;
+    size_t buffer_len;
+    size_t offset;
+};
+
+// Do real socket writing. Return < 0 if writing error.
 static
-int read_tcp_netmsg(int fd, char * buffer)
+int write_tcp_data_nonblocking(int fd)
 {
-    size_t read_size = 0;
+    // Get buffer in list head
+    if ( list_empty(&write_buffer_list) )
+        return 0;
 
-    // Read netmsg length
+    struct write_buffer_entry * entry = list_first_entry(&write_buffer_list, struct write_buffer_entry, list);
+    assert(entry->offset < entry->buffer_len - 1);
+
+    // Write it.
+    ssize_t written_size = 0;
     do {
-       int rv = read_tcp_data_nonblocking(fd, buffer, &read_size, sizeof(uint32_t));       
-       if ( rv < 0 )
-          return rv;
-    } while (read_size < sizeof(uint32_t) );
+        written_size = write(fd, entry->buffer + entry->offset, entry->buffer_len - entry->offset);
+    } while ( written_size < 0 && errno == EINTR );
 
-    uint32_t msg_len = ntohl(*(uint32_t *)buffer);
+    if ( written_size < 0 ) {
+       if ( errno == EAGAIN || errno == EWOULDBLOCK ) {
+          return 0;          
+       }
+#if DEBUG
+       fprintf(stderr, "write to fd %d failed: %s\n", fd, strerror(errno));
+#endif     
+       
+       return -1;   
+    }
 
-    // Read netmsg
-    read_size = 0;
+    // EOF
+    if ( written_size == 0 ) {
+#if DEBUG
+       fprintf(stderr, "write to fd %d EOF\n", fd);
+#endif     
+       return -1;   
+    }
 
-    do {
-       int rv = read_tcp_data_nonblocking(fd, buffer, &read_size, msg_len);       
-       if ( rv < 0 )
-          return rv;
-    } while (read_size < msg_len);
+    // Success
+    entry->offset += written_size;
+    assert(entry->offset < entry->buffer_len);
 
+    if ( entry->offset == entry->buffer_len - 1 ) {
+        list_del(&(entry->list));
+        free(entry);
+    }
+
+    return written_size;
+}
+
+// Queue a buffer for writing if ready.
+static
+int queue_writing_data(char * write_buffer, size_t write_len)
+{
+    // Allocate
+    struct write_buffer_entry * entry = 
+           (struct write_buffer_entry *)malloc(sizeof(struct write_buffer_entry) + write_len);
+
+    if ( entry == NULL ) {
+       return -1;        
+    }
+
+    // Fill
+    entry->buffer = (char *)(entry + 1);
+    entry->buffer_len = write_len;
+    entry->offset = 0;
+
+    // Add
+    list_add_tail(&(entry->list), &write_buffer_list);
     return 0;
 }
 
+// Clear whole writeing queue
+static
+void clear_writing_queue()
+{
+    struct write_buffer_entry * entry, *temp;
+
+    list_for_each_entry_safe(entry, temp, &write_buffer_list, list) {
+        list_del(&(entry->list));
+        free(entry);
+    }
+
+    assert(list_empty(&write_buffer_list));
+}
+
 // Handling packets received from Internet.
+//
+// < 0 error. Should reconnect.
 static int network_receiving(int tunfd, int sockfd)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
@@ -157,8 +243,63 @@ static int network_receiving(int tunfd, int sockfd)
 	struct iovec iov[2];
 	int rc;
 
+    // For non-blokcing tcp reading
+    static char tcp_read_buffer[NM_PI_BUFFER_SIZE] = { 0 };
+    static size_t tcp_read_buffer_len = 0;
+    static size_t tcp_msg_len = 0; // == 0 means we should read msg_len, otherwise read net_msg data
+
     if ( config.use_tcp ) {
-        rc = read_tcp_netmsg(sockfd, read_buffer);
+
+        if ( tcp_msg_len == 0 ) {
+        
+           int rv = read_tcp_data_nonblocking(sockfd, tcp_read_buffer, &tcp_read_buffer_len, sizeof(uint32_t));
+
+           if ( rv < 0 ) {
+#if DEBUG
+              printf("Read from tcp fd %d error. Should close and reconnect\n", sockfd);
+#endif            
+              return -1;
+           }
+
+           // Not fully read in
+           if ( tcp_read_buffer_len < sizeof(uint32_t) )
+              return 0;
+
+           // Got msg_len
+           tcp_msg_len = ntohl(*(uint32_t *)tcp_read_buffer);
+           tcp_read_buffer_len = 0;
+
+#if DEBUG
+           fprintf(stderr, "Read msg_len %zu from sockfd %d\n", tcp_msg_len, sockfd);
+#endif 
+
+           return 0;
+
+        } // read msg_len
+
+        // Read ata
+        int rv = read_tcp_data_nonblocking(sockfd, tcp_read_buffer, &tcp_read_buffer_len, tcp_msg_len);
+        if ( rv < 0 ) {
+#if DEBUG
+           printf("Read tcp data (len %zu) from fd %d failed\n", tcp_msg_len, sockfd);           
+#endif            
+           return -1;
+        }
+
+        // Not fully read
+        if ( tcp_read_buffer_len < tcp_msg_len ) 
+           return 0;
+
+        // Got all 
+#if DEBUG
+        fprintf(stderr, "Read net_msg len %zu from sockfd %d\n", tcp_msg_len, sockfd);
+#endif 
+        memcpy(read_buffer, tcp_read_buffer, tcp_read_buffer_len);
+        rc = tcp_msg_len;
+
+        // Reset
+        tcp_read_buffer_len = 0;
+        tcp_msg_len = 0;
     }
     else {
 	    real_peer_alen = sizeof(real_peer);
@@ -358,6 +499,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
     if ( config.use_tcp ) {
         uint32_t msg_len = htonl(out_dlen);
+        /*
         struct iovec iov[2];
         iov[0].iov_base = &msg_len;
         iov[0].iov_len = sizeof(uint32_t);
@@ -365,10 +507,14 @@ static int tunnel_receiving(int tunfd, int sockfd)
         iov[1].iov_len = out_dlen;
 
         rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
+        */
+        queue_writing_data((char *)&msg_len, sizeof(uint32_t));
+        queue_writing_data((char *)out_data, out_dlen);
+
+        rc = 1;
 
 #if DEBUG
-        printf("write msg_len %u(0x%x) to network\n", msg_len, msg_len);
-        hexdump(&msg_len, sizeof(uint32_t));
+        printf("queue write msg_len %zu\n", out_dlen);
 #endif
 
     }
@@ -377,7 +523,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
     }
 
 #if DEBUG
-    printf("tunnel -> network: %zu bytes. Write to network returned %d\n", out_dlen, rc);
+    printf("tunnel -> network: %zu bytes\n", out_dlen);
     hexdump(out_data, out_dlen);
 #endif	
 
@@ -437,6 +583,7 @@ static int peer_keepalive(int sockfd)
 
 	if ( config.use_tcp ) {
         uint32_t msg_len = htonl(out_len);
+        /*
         struct iovec iov[2];
         iov[0].iov_len = sizeof(uint32_t);
         iov[0].iov_base = &msg_len;
@@ -444,6 +591,11 @@ static int peer_keepalive(int sockfd)
         iov[1].iov_base = out_msg;
 
         rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
+        */
+        queue_writing_data((char *)&msg_len, sizeof(uint32_t));
+        queue_writing_data((char *)out_msg, out_len);
+
+        rc = 1;
     }
     else {
 	    rc = (int)send(sockfd, out_msg, out_len, 0);
@@ -518,6 +670,31 @@ static int try_resolve_and_connect(const char *peer_addr_pair, struct sockaddr_i
 }
 
 
+static
+int _reconnect(int sockfd, const char * peer_addr_pair, struct sockaddr_inx * peer_addr)
+{
+	char s_peer_addr[50];
+
+			if (sockfd >= 0)
+				close(sockfd);
+
+			do {
+				if ((sockfd = try_resolve_and_connect(peer_addr_pair, peer_addr)) < 0) {
+					fprintf(stderr, "Unable to connect to '%s', retrying.\n", peer_addr_pair);
+					sleep(5);
+				}
+			} while (sockfd < 0);
+
+			last_keepalive = 0;
+			last_recv = current_ts;
+
+			inet_ntop(peer_addr->sa.sa_family, addr_of_sockaddr(peer_addr), s_peer_addr,
+					  sizeof(s_peer_addr));
+			printf("Reconnected to %s:%u. socket %d\n", s_peer_addr, ntohs(port_of_sockaddr(peer_addr)), sockfd);
+
+    return sockfd;
+}
+
 // The entry. Called from main() in minivtun.c directly after ifconfig interfaces
 //
 // @param peer_addr_pair:  <remote-host>:<port>
@@ -525,7 +702,7 @@ int run_client(int tunfd, const char *peer_addr_pair)
 {
 	struct timeval timeo;
 	int sockfd = -1, rc;
-	fd_set rset;
+	fd_set rset, wset;
 	char s_peer_addr[50];
 	struct sockaddr_inx peer_addr;
 
@@ -581,15 +758,20 @@ int run_client(int tunfd, const char *peer_addr_pair)
 	last_keepalive = 0;
 
 	for (;;) {
+
 		FD_ZERO(&rset);
 		FD_SET(tunfd, &rset);
 		if (sockfd >= 0)
 			FD_SET(sockfd, &rset);
 
+        FD_ZERO(&wset);
+        if ( sockfd >= 0 )
+           FD_SET(sockfd, &wset);
+
 		timeo.tv_sec = 2;
 		timeo.tv_usec = 0;
 
-		rc = select((tunfd > sockfd ? tunfd : sockfd) + 1, &rset, NULL, NULL, &timeo);
+		rc = select((tunfd > sockfd ? tunfd : sockfd) + 1, &rset, &wset, NULL, &timeo);
 		if (rc < 0) {
 			fprintf(stderr, "*** select(): %s.\n", strerror(errno));
 			return -1;
@@ -605,7 +787,7 @@ int run_client(int tunfd, const char *peer_addr_pair)
 		/* Packet transmission timed out, send keep-alive packet. */
 		if (current_ts - last_keepalive > config.keepalive_timeo) {
 			if (sockfd >= 0) {                
-				int rv = peer_keepalive(sockfd);
+				peer_keepalive(sockfd);
             }
 
 		}
@@ -615,6 +797,7 @@ int run_client(int tunfd, const char *peer_addr_pair)
 
 reconnect:
 			/* Reopen the socket for a different local port. */
+/*
 			if (sockfd >= 0)
 				close(sockfd);
 
@@ -631,6 +814,8 @@ reconnect:
 			inet_ntop(peer_addr.sa.sa_family, addr_of_sockaddr(&peer_addr), s_peer_addr,
 					  sizeof(s_peer_addr));
 			printf("Reconnected to %s:%u. socket %d\n", s_peer_addr, ntohs(port_of_sockaddr(&peer_addr)), sockfd);
+*/            
+            sockfd = _reconnect(sockfd, peer_addr_pair, &peer_addr);
 			continue;
 		}
 
@@ -640,7 +825,7 @@ reconnect:
 
 		if (sockfd >= 0 && FD_ISSET(sockfd, &rset)) {
 			rc = network_receiving(tunfd, sockfd);
-			if (rc != 0) {
+			if (rc < 0) {
 				fprintf(stderr, "Connection went bad. About to reconnect.\n");
 				goto reconnect;
 			}
@@ -650,7 +835,27 @@ reconnect:
 			rc = tunnel_receiving(tunfd, sockfd);
 			assert(rc == 0);
 		}
-	}
+
+        // socket is writable
+        if ( sockfd >= 0 && FD_ISSET(sockfd, &wset) ) {
+            int rv = write_tcp_data_nonblocking(sockfd);
+#if DEBUG
+            if ( rv > 0 )
+               fprintf(stderr, "Write %d bytes to fd %d\n", rv, sockfd);
+            else if ( rv == 0 )
+               fprintf(stderr, "Nothing to write to fd %d?\n", rv);
+            else 
+               fprintf(stderr, "Write to fd %d failed.\n", rv);
+#endif
+            // If writing failed, should we reconnect it or wait for rset?
+            if ( rv < 0 ) {
+				fprintf(stderr, "Connection went bad due to writing failure. About to reconnect.\n");
+                clear_writing_queue();
+				goto reconnect;                
+            }
+        } // if writable
+
+	} // for (;;)
 
 	return 0;
 }

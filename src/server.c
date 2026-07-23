@@ -111,6 +111,7 @@ struct ra_entry {
     int client_fd; // >= 0 tcp. -1 udp
     uint8_t tcp_read_buffer[NM_PI_BUFFER_SIZE];
     size_t tcp_read_buffer_len;
+    uint32_t tcp_msg_len; // == 0 if we should read msg_len, otherwise we already have it
 
 };
 
@@ -164,6 +165,7 @@ static struct ra_entry * ra_create_accepted_only(const struct sockaddr_inx * sa,
     // re->is_tcp = true;
     re->client_fd = client_fd;
     re->tcp_read_buffer_len = 0;
+    re->tcp_msg_len = 0;
 
 	list_add_tail(&re->list, &ra_entries_accepted_only);
 	ra_entries_accepted_only_len++;
@@ -206,6 +208,7 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa, bool is_
     re->client_fd = client_fd;
     // re->is_tcp = is_tcp;
     re->tcp_read_buffer_len = 0;
+    re->tcp_msg_len = 0;
 
 	list_add_tail(&re->list, chain);
 	ra_set_len++;
@@ -521,10 +524,6 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	local_to_netmsg(nmsg, &out_msg, &out_len);
 
-#if DEBUG
-    printf("ra_entry_keepalive sockfd %d\n", sockfd);
-#endif
-
     if ( re->client_fd >= 0 ) {
 
         uint32_t msg_len = htonl(out_len);
@@ -535,10 +534,17 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
         iov[1].iov_len = out_len;
         rc = writev(re->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
 
+#if DEBUG
+        printf("ra_entry_keepalive write %zu to tcp fd %d. result %d\n", out_len, re->client_fd, rc);
+#endif
+
     }
     else {
 	   rc = (int)sendto(sockfd, out_msg, out_len, 0, (struct sockaddr *)&re->real_addr,
 		     	        sizeof_sockaddr(&re->real_addr));
+#if DEBUG
+        printf("ra_entry_keepalive send %zu to udp fd %d. result %d\n", out_len, sockfd, rc);
+#endif
     }
 
 	/* Update 'last_xmit' only when it's really sent out. */
@@ -686,10 +692,9 @@ int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset
 
 // This handles packet from the client. i.e. It should be a netmsg.
 //
-// tclient == NULL && re == NULL: udp
-// tclient == NULL && re != NULL: tcp accepted only
-// tclient != NULL: tcp
-static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient, struct ra_entry * re)
+// re == NULL: udp
+// re != NULL: tcp
+static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
 	struct minivtun_msg *nmsg;
@@ -705,54 +710,56 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient,
 	struct iovec iov[2];
 	int rc;
     int client_fd = -1;
-    bool is_tcp = tclient != NULL || re != NULL;
 
     // Receive the wrapped packet (netmsg)
 
     // TCP
-    if ( tclient != NULL || re != NULL ) {
+    if ( re != NULL ) {
        
-       assert( !(tclient && re) );
-       assert( (tclient && !(tclient->ra->accepted_only)) || (re && re->accepted_only) );
+       struct ra_entry * entry = re;
+
+       assert(entry->client_fd >= 0 && sockfd == entry->client_fd);
 
        // Read the length of netmsg (32bit BE)
-       uint32_t msg_len = 0;
-       struct ra_entry * entry = tclient ? tclient->ra : re;
+       if ( re->tcp_msg_len == 0 ) {
 
-       assert(entry->client_fd >= 0);
+          int read_result = read_tcp_client_data(sockfd, entry->tcp_read_buffer, &(entry->tcp_read_buffer_len), 
+                                                 sizeof(uint32_t));
 
-       int read_result = read_tcp_client_data(sockfd, entry->tcp_read_buffer, &(entry->tcp_read_buffer_len), 
-                                              sizeof(uint32_t));
-
-       // error
-       if ( read_result < 0 ) {
+          // error
+          if ( read_result < 0 ) {
 #if DEBUG          
-          fprintf(stderr, "tcp client fd %d closed due to read msg_len error\n", entry->client_fd);
+             fprintf(stderr, "tcp client fd %d closed due to read msg_len error\n", entry->client_fd);
 #endif          
-          close_tcp_client(entry);
+             close_tcp_client(entry);
 
-          if ( entry->accepted_only )
-             ra_entry_release_accepted_only(entry);
-          else
-             tun_client_release_for_re(entry);
+             if ( entry->accepted_only )
+                ra_entry_release_accepted_only(entry);
+             else
+                tun_client_release_for_re(entry);
 
-          return -1;
-       }
+             return -1;
+          }
 
-       // Next
-       if ( read_result == 0 )
-          return 0;
+          // Next
+          if ( read_result == 0 )
+             return 0;
 
-       // We got netmsg length
-       msg_len = ntohl(*(uint32_t *)entry->tcp_read_buffer);
-       entry->tcp_read_buffer_len = 0; // reset read len
+          // We got netmsg length
+          entry->tcp_msg_len = ntohl(*(uint32_t *)entry->tcp_read_buffer);
+          entry->tcp_read_buffer_len = 0; // reset read len       
        
 #if DEBUG
-    printf("network_receiving: received msg_len %d (0x%x)\n", msg_len, msg_len);
+          printf("network_receiving: received msg_len %d\n", entry->tcp_msg_len);
 #endif
+
+          return 0;
+
+       } // read msg_len
+       
        // Read net_msg
-       read_result = read_tcp_client_data(sockfd, entry->tcp_read_buffer, &entry->tcp_read_buffer_len, 
-                                          msg_len);
+       int read_result = read_tcp_client_data(sockfd, entry->tcp_read_buffer, &entry->tcp_read_buffer_len, 
+                                              entry->tcp_msg_len);
        if ( read_result < 0 ) {
 #if DEBUG          
           fprintf(stderr, "tun tcp client fd %d closed due to read net_msg error\n", entry->client_fd);
@@ -772,6 +779,7 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient,
        memcpy(read_buffer, entry->tcp_read_buffer, entry->tcp_read_buffer_len);
        rc = entry->tcp_read_buffer_len;
        entry->tcp_read_buffer_len = 0;
+       entry->tcp_msg_len = 0;
 
        // set real_peer & real_peer_alen
        real_peer = entry->real_addr;
@@ -820,7 +828,7 @@ static int network_receiving(int tunfd, int sockfd, struct tun_client * tclient,
 
 		// Keepalive packet
 	case MINIVTUN_MSG_KEEPALIVE:
-		if ((new_re = ra_get_or_create(&real_peer, is_tcp, client_fd))) {
+		if ((new_re = ra_get_or_create(&real_peer, re != NULL, client_fd))) {
 			new_re->last_recv = current_ts;
 			ra_put_no_free(new_re);
 		}
@@ -1193,7 +1201,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 
             // The udp socket to clients
 			if (FD_ISSET(sockfd, &rset)) {
-				rc = network_receiving(tunfd, sockfd, NULL, NULL);
+				rc = network_receiving(tunfd, sockfd, NULL);
 			}
             // tun fd. The socket to receive outside packets
 			if (FD_ISSET(tunfd, &rset)) {
@@ -1213,20 +1221,20 @@ int run_server(int tunfd, const char *loc_addr_pair)
                 }
             }
 
-            // tcp client connections in va_map
-            for ( int i = 0; i < VA_MAP_HASH_SIZE; i++ ) {
+            // tcp client connections in ra_set
+            for ( int i = 0; i < RA_SET_HASH_SIZE; i++ ) {
 
-                struct list_head *chain = &va_map_hbase[i];
-                struct tun_client *ce, *temp;
+                struct list_head *chain = &ra_set_hbase[i];
+                struct ra_entry *re, *temp;
 
-                list_for_each_entry_safe (ce, temp, chain, list) {
-                    if (ce->ra->client_fd >= 0) {
-                       if ( FD_ISSET(ce->ra->client_fd, &rset) ) {
+                list_for_each_entry_safe (re, temp, chain, list) {
+                    if (re->client_fd >= 0) {
+                       if ( FD_ISSET(re->client_fd, &rset) ) {
 #if DEBUG
-                          fprintf(stderr, "connected client fd %d ready to read\n", ce->ra->client_fd);
+                          fprintf(stderr, "connected client fd %d ready to read\n", re->client_fd);
 #endif                    
-                          int client_fd = ce->ra->client_fd;
-                          rc = network_receiving(tunfd, client_fd, ce, NULL);
+                          int client_fd = re->client_fd;
+                          rc = network_receiving(tunfd, client_fd, re);
                           if ( rc < 0 ) {
 #if DEBUG
                              fprintf(stderr, "connected client fd %d network receiving failed. Clear\n", client_fd);
@@ -1246,7 +1254,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
                     fprintf(stderr, "accepted client fd %d ready to read\n", entry->client_fd);
 #endif                    
                     int client_fd = entry->client_fd;
-                    rc = network_receiving(tunfd, entry->client_fd, NULL, entry); 
+                    rc = network_receiving(tunfd, entry->client_fd, entry); 
                     if ( rc < 0 ) {
 #if DEBUG
                         fprintf(stderr, "accepted client fd %d network receiving failed.\n", client_fd);
