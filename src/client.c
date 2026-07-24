@@ -182,9 +182,9 @@ int write_tcp_data_nonblocking(int fd)
 
     // Success
     entry->offset += written_size;
-    assert(entry->offset < entry->buffer_len);
+    assert(entry->offset <= entry->buffer_len);
 
-    if ( entry->offset == entry->buffer_len - 1 ) {
+    if ( entry->offset == entry->buffer_len ) {
         list_del(&(entry->list));
         free(entry);
     }
