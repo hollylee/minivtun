@@ -205,7 +205,7 @@ int queue_writing_data(char * write_buffer, size_t write_len)
     }
 
     // Fill
-    entry->buffer = (char *)(entry + 1);
+    memcpy(entry->buffer, (char *)(entry + 1), write_len);
     entry->buffer_len = write_len;
     entry->offset = 0;
 
