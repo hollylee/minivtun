@@ -251,12 +251,14 @@ static inline void ra_entry_release(struct ra_entry *re)
 
     assert(re != NULL);
 	assert(re->refs == 0);
+    assert(re->client_fd < 0);
+
 	list_del(&re->list);
 	ra_set_len--;
 
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
 			  s_real_addr, sizeof(s_real_addr));
-	printf("Recycled client [%s:%u]. %s\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), re->client_fd >= 0 ? "tcp" : "udp");
+	printf("Recycled client [%s:%u]\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)));
 
 	free(re);
 }

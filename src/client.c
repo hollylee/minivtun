@@ -148,7 +148,7 @@ struct write_buffer_entry {
 static
 int write_tcp_data_nonblocking(int fd)
 {
-    // Get buffer in list head
+    // Get buffer in list head. It is OK if nothing to write
     if ( list_empty(&write_buffer_list) )
         return 0;
 
@@ -843,8 +843,9 @@ reconnect:
 #if DEBUG
             if ( rv > 0 )
                fprintf(stderr, "Write %d bytes to fd %d\n", rv, sockfd);
-            else if ( rv == 0 )
-               fprintf(stderr, "Nothing to write to fd %d?\n", sockfd);
+            else if ( rv == 0 ) {
+               // fprintf(stderr, "Nothing to write to fd %d?\n", sockfd);
+            }
             else 
                fprintf(stderr, "Write to fd %d failed.\n", rv);
 #endif
