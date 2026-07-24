@@ -315,11 +315,12 @@ static int network_receiving(int tunfd, int sockfd)
 	if (rc <= 0)
 		return 0;
 
+    // nmsg is not null for real IP data only.
 	nmsg = _network_data_handler(read_buffer, rc, crypt_buffer, &pi);
 
 #if DEBUG
     if ( nmsg == 0 )
-	   printf("nmsg is NULL\n");
+	   printf("nmsg is NULL or keepalive\n");
 	else
 	   dump_nmsg(nmsg);
 #endif	
