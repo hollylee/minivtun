@@ -843,7 +843,7 @@ reconnect:
             if ( rv > 0 )
                fprintf(stderr, "Write %d bytes to fd %d\n", rv, sockfd);
             else if ( rv == 0 )
-               fprintf(stderr, "Nothing to write to fd %d?\n", rv);
+               fprintf(stderr, "Nothing to write to fd %d?\n", sockfd);
             else 
                fprintf(stderr, "Write to fd %d failed.\n", rv);
 #endif

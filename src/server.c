@@ -232,7 +232,7 @@ static inline void ra_entry_release_accepted_only(struct ra_entry *re)
 	char s_real_addr[50];
 
     assert(re != NULL);
-    assert(re->client_fd >= 0);
+    assert(re->accepted_only);
 
     ra_put_no_free(re);
 
@@ -786,7 +786,7 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
        real_peer_alen = entry->real_addr.sa.sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
        client_fd = entry->client_fd;
 
-       // 
+       // Release the entry in accepted list only. fd is alive
        if ( entry->accepted_only )
           ra_entry_release_accepted_only(entry);
     } 
