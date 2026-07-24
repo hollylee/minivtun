@@ -107,8 +107,8 @@ struct ra_entry {
 
     // TCP transport only
     bool accepted_only;
-    // bool is_tcp;
     int client_fd; // >= 0 tcp. -1 udp
+    bool is_tcp; // client_fd may be closed and set to -1. but we may still need to distinguish tcp and udp. assigned in ra_entry creation
     uint8_t tcp_read_buffer[NM_PI_BUFFER_SIZE];
     size_t tcp_read_buffer_len;
     uint32_t tcp_msg_len; // == 0 if we should read msg_len, otherwise we already have it
@@ -162,7 +162,7 @@ static struct ra_entry * ra_create_accepted_only(const struct sockaddr_inx * sa,
 	re->real_addr = *sa;
 	re->refs = 1;
     re->accepted_only = true;
-    // re->is_tcp = true;
+    re->is_tcp = true;
     re->client_fd = client_fd;
     re->tcp_read_buffer_len = 0;
     re->tcp_msg_len = 0;
@@ -188,7 +188,7 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa, bool is_
 
     // Got existing entry
 	list_for_each_entry (re, chain, list) {
-		if (is_sockaddr_equal(&re->real_addr, sa) && bool_equal(re->client_fd >= 0, is_tcp)) {
+		if (is_sockaddr_equal(&re->real_addr, sa) && bool_equal(re->is_tcp, is_tcp)) {
 			re->refs++;
 			return re;
 		}
@@ -206,7 +206,7 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa, bool is_
 
     re->accepted_only = false;
     re->client_fd = client_fd;
-    // re->is_tcp = is_tcp;
+    re->is_tcp = is_tcp;
     re->tcp_read_buffer_len = 0;
     re->tcp_msg_len = 0;
 
@@ -258,7 +258,7 @@ static inline void ra_entry_release(struct ra_entry *re)
 
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
 			  s_real_addr, sizeof(s_real_addr));
-	printf("Recycled client [%s:%u]\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)));
+	printf("Recycled client [%s:%u]. %s\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), re->is_tcp ? "tcp" : "udp");
 
 	free(re);
 }
@@ -381,7 +381,7 @@ static inline void tun_client_release(struct tun_client *ce)
 	    	  s_real_addr, sizeof(s_real_addr));
 
    	printf("Recycled virtual address [%s] at [%s:%u]. %s\n", s_virt_addr, s_real_addr,
-			ntohs(port_of_sockaddr(&ce->ra->real_addr)), ce->ra->client_fd >= 0 ? "tcp" : "udp");
+			ntohs(port_of_sockaddr(&ce->ra->real_addr)), ce->ra->is_tcp ? "tcp" : "udp");
 
     ra_put_no_free(ce->ra);
 
@@ -451,7 +451,7 @@ static struct tun_client *tun_client_get_or_create(
         // Have this virtual address.
 		if (tun_addr_comp(&ce->virt_addr, vaddr) == 0) {
 
-			if ( !is_sockaddr_equal(&ce->ra->real_addr, raddr) || !bool_equal(ce->ra->client_fd >= 0, tcp_client_fd >= 0) ){
+			if ( !is_sockaddr_equal(&ce->ra->real_addr, raddr) || !bool_equal(ce->ra->is_tcp >= 0, tcp_client_fd >= 0) ){
 				/* Real address changed, reassign a new entry for it. */
 				ra_put_no_free(ce->ra);
 				if ((ce->ra = ra_get_or_create(raddr, tcp_client_fd >= 0, tcp_client_fd)) == NULL) {
@@ -490,7 +490,7 @@ static struct tun_client *tun_client_get_or_create(
 	    	  s_real_addr, sizeof(s_real_addr));
 
 	printf("New virtual address [%s] at [%s:%u]. %s\n", s_virt_addr, s_real_addr,
-	    	ntohs(port_of_sockaddr(&ce->ra->real_addr)), ce->ra->client_fd >= 0 ? "tcp" : "udp");
+	    	ntohs(port_of_sockaddr(&ce->ra->real_addr)), ce->ra->is_tcp ? "tcp" : "udp");
 
 	return ce;
 }
@@ -498,7 +498,7 @@ static struct tun_client *tun_client_get_or_create(
 static
 void close_tcp_client(struct ra_entry * re)
 {
-     assert(re->client_fd >= 0);
+     assert(re->client_fd >= 0 && re->is_tcp);
      close(re->client_fd);
      re->client_fd = -1;
 }
@@ -526,7 +526,7 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	local_to_netmsg(nmsg, &out_msg, &out_len);
 
-    if ( re->client_fd >= 0 ) {
+    if ( re->is_tcp ) {
 
         uint32_t msg_len = htonl(out_len);
         struct iovec iov[2];
@@ -591,7 +591,7 @@ static void va_ra_walk_continue(int sockfd)
 			list_for_each_entry_safe (re, __re, &ra_set_hbase[ra_index], list) {
 				if (current_ts - re->last_recv > config.reconnect_timeo) {
 					if (re->refs == 0) {
-                        if ( re->client_fd >= 0 )
+                        if ( re->is_tcp )
                            close_tcp_client(re);
 						ra_entry_release(re);
 					}
@@ -989,7 +989,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 				return 0;
 
 			/* Finally, create the client entry. Using gateway's real address */
-			if ((ce = tun_client_get_or_create(&virt_addr, &ce->ra->real_addr, ce->ra->client_fd >= 0 ? ce->ra->client_fd : -1)) == NULL)
+			if ((ce = tun_client_get_or_create(&virt_addr, &ce->ra->real_addr, ce->ra->is_tcp ? ce->ra->client_fd : -1)) == NULL)
 				return 0;
 		} else {
 			return 0;
@@ -1018,7 +1018,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	hexdump(out_data, out_dlen);
 #endif	
 
-    if ( ce->ra->client_fd >= 0 ) {
+    if ( ce->ra->is_tcp ) {
 
         assert(ce->ra->client_fd >= 0);
 
@@ -1175,7 +1175,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
             struct ra_entry *re;
 
             list_for_each_entry (re, chain, list) {
-                if (re->client_fd >= 0) {
+                if (re->is_tcp) {
                    FD_SET(re->client_fd, &rset);
                    max_fd = max_of(max_fd, re->client_fd);
 #if DEBUG            
@@ -1230,7 +1230,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
                 struct ra_entry *re, *temp;
 
                 list_for_each_entry_safe (re, temp, chain, list) {
-                    if (re->client_fd >= 0) {
+                    if (re->is_tcp) {
                        if ( FD_ISSET(re->client_fd, &rset) ) {
 #if DEBUG
                           fprintf(stderr, "connected client fd %d ready to read\n", re->client_fd);
