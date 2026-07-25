@@ -185,7 +185,7 @@ static struct ra_entry * ra_create_accepted_only(const struct sockaddr_inx * sa,
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
 			  s_real_addr, sizeof(s_real_addr));
 
-	printf("New client [%s:%u]\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)));
+	printf("New accepted only client [%s:%u]. clients: %u\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), ra_set_len);
 
 	return re;
 }
@@ -228,7 +228,7 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa, bool is_
 
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
 			  s_real_addr, sizeof(s_real_addr));
-	printf("New client [%s:%u]\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)));
+	printf("New client [%s:%u]. clients: %u\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), ra_set_len);
 
 	return re;
 }
@@ -253,7 +253,7 @@ static inline void ra_entry_release_accepted_only(struct ra_entry *re)
 	ra_entries_accepted_only_len--;
 
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr), s_real_addr, sizeof(s_real_addr));
-	printf("Released client [%s:%u] from accepted only.\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)));
+	printf("Released client [%s:%u] from accepted only. clients: %u\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), ra_set_len);
 
 	free(re);
 }
@@ -271,7 +271,8 @@ static inline void ra_entry_release(struct ra_entry *re)
 
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr),
 			  s_real_addr, sizeof(s_real_addr));
-	printf("Recycled client [%s:%u]. %s\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), re->is_tcp ? "tcp" : "udp");
+	printf("Recycled client [%s:%u]. %s. clients: %u\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), 
+        re->is_tcp ? "tcp" : "udp", ra_set_len);
 
 	free(re);
 }
@@ -605,24 +606,28 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	local_to_netmsg(nmsg, &out_msg, &out_len);
 
-    if ( re->is_tcp ) {
+    if ( re->is_tcp ) { // Exclude recycled 
 
-        uint32_t msg_len = htonl(out_len);
-        /*
-        struct iovec iov[2];
-        iov[0].iov_base = &msg_len;
-        iov[0].iov_len = sizeof(uint32_t);
-        iov[1].iov_base = out_msg;
-        iov[1].iov_len = out_len;
-        rc = writev(re->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
-        */
-        queue_tcp_write_data(re, &msg_len, sizeof(uint32_t));
-        queue_tcp_write_data(re, out_msg, out_len);
+        if ( re->client_fd >= 0 ) {
+
+            uint32_t msg_len = htonl(out_len);
+            /*
+            struct iovec iov[2];
+            iov[0].iov_base = &msg_len;
+            iov[0].iov_len = sizeof(uint32_t);
+            iov[1].iov_base = out_msg;
+            iov[1].iov_len = out_len;
+            rc = writev(re->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
+            */
+            queue_tcp_write_data(re, &msg_len, sizeof(uint32_t));
+            queue_tcp_write_data(re, out_msg, out_len);
+
+#if DEBUG
+            printf("ra_entry_keepalive queue %zu to tcp fd %d for writing.\n", out_len, re->client_fd);
+#endif
+        }
 
         rc = 1;
-#if DEBUG
-        printf("ra_entry_keepalive queue %zu to tcp fd %d for writing.\n", out_len, re->client_fd);
-#endif
 
     }
     else {
@@ -635,7 +640,7 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 
     /* Update 'last_xmit' only when it's really sent out. */
     if (rc > 0) {
-	  re->last_xmit = current_ts;
+	   re->last_xmit = current_ts;
     }
 
 	return rc;
