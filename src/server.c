@@ -113,7 +113,17 @@ struct ra_entry {
     size_t tcp_read_buffer_len;
     uint32_t tcp_msg_len; // == 0 if we should read msg_len, otherwise we already have it
 
+    // Field for nonblocking writing.
+    struct list_head tcp_write_list;
 };
+
+struct tcp_write_buffer {
+    uint8_t * buffer;
+    size_t buffer_len;
+    size_t offset;
+    struct list_head list;
+};
+
 
 /* Hash table for dedicated clients (real addresses). */
 #define RA_SET_HASH_SIZE  (1 << 3)
@@ -166,6 +176,7 @@ static struct ra_entry * ra_create_accepted_only(const struct sockaddr_inx * sa,
     re->client_fd = client_fd;
     re->tcp_read_buffer_len = 0;
     re->tcp_msg_len = 0;
+    INIT_LIST_HEAD(&(re->tcp_write_list));
 
 	list_add_tail(&re->list, &ra_entries_accepted_only);
 	ra_entries_accepted_only_len++;
@@ -209,6 +220,8 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa, bool is_
     re->is_tcp = is_tcp;
     re->tcp_read_buffer_len = 0;
     re->tcp_msg_len = 0;
+
+    INIT_LIST_HEAD(&(re->tcp_write_list));
 
 	list_add_tail(&re->list, chain);
 	ra_set_len++;
@@ -503,6 +516,72 @@ void close_tcp_client(struct ra_entry * re)
      re->client_fd = -1;
 }
 
+// Write data to a nonblocking tcp fd.
+// 
+// Return <0 if error (including EOF) 
+// Return 0 if nothing occur
+// Return >0 means bytes written
+static 
+int write_queued_tcp_data_nonblocking(int fd, struct ra_entry * entry)
+{
+    // Pick a buffer from queue
+    if ( list_empty(&(entry->tcp_write_list)) )
+       return 0;
+
+    struct tcp_write_buffer * write_buffer = list_first_entry(&(entry->tcp_write_list), struct tcp_write_buffer, list);
+    assert(write_buffer->offset < write_buffer->buffer_len);
+
+    ssize_t written_size = 0;
+    do {
+        written_size = write(fd, write_buffer->buffer + write_buffer->offset, write_buffer->buffer_len - write_buffer->offset);
+    } while (written_size == -1 && errno == EINTR);
+
+    if ( written_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) )
+       return 0;
+
+    // Real error
+    if ( written_size < 0 )
+       return -1;
+
+    // EOF
+    if ( written_size == 0 )
+       return -1;
+
+    // Succeeded
+    write_buffer->offset += written_size;
+    assert(write_buffer->offset <= write_buffer->buffer_len);
+
+    // Remove the completed buffer
+    if ( write_buffer->offset == write_buffer->buffer_len ) {
+       list_del(&(write_buffer->list));
+       free(write_buffer);
+    }
+
+    return written_size;
+}
+
+// Queue data into writing queue. -1 if allocation error.
+static
+int queue_tcp_write_data(struct ra_entry * entry, void * buffer, size_t buffer_len)
+{
+     // Allocate a tcp_write_buffer struct and the buffer inside
+     struct tcp_write_buffer * write_buffer = 
+         (struct tcp_write_buffer *)malloc(sizeof(struct tcp_write_buffer) + buffer_len);
+
+     if ( write_buffer == NULL )  
+        return -1;
+
+    // Fill the buffer
+    write_buffer->buffer = (uint8_t *)(write_buffer + 1);
+    memcpy(write_buffer->buffer, buffer, buffer_len);
+    write_buffer->buffer_len = buffer_len;
+    write_buffer->offset = 0;
+
+    // link into the list in entry
+    list_add_tail(&(write_buffer->list), &(entry->tcp_write_list));
+    return 0;
+}
+
 
 /**
  * Send keep-alive packet to the corresponding client
@@ -529,15 +608,20 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
     if ( re->is_tcp ) {
 
         uint32_t msg_len = htonl(out_len);
+        /*
         struct iovec iov[2];
         iov[0].iov_base = &msg_len;
         iov[0].iov_len = sizeof(uint32_t);
         iov[1].iov_base = out_msg;
         iov[1].iov_len = out_len;
         rc = writev(re->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
+        */
+        queue_tcp_write_data(re, &msg_len, sizeof(uint32_t));
+        queue_tcp_write_data(re, out_msg, out_len);
 
+        rc = 1;
 #if DEBUG
-        printf("ra_entry_keepalive write %zu to tcp fd %d. result %d\n", out_len, re->client_fd, rc);
+        printf("ra_entry_keepalive queue %zu to tcp fd %d for writing.\n", out_len, re->client_fd);
 #endif
 
     }
@@ -549,10 +633,10 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 #endif
     }
 
-	/* Update 'last_xmit' only when it's really sent out. */
-	if (rc > 0) {
-		re->last_xmit = current_ts;
-	}
+    /* Update 'last_xmit' only when it's really sent out. */
+    if (rc > 0) {
+	  re->last_xmit = current_ts;
+    }
 
 	return rc;
 }
@@ -1023,15 +1107,17 @@ static int tunnel_receiving(int tunfd, int sockfd)
         assert(ce->ra->client_fd >= 0);
 
         uint32_t msg_len = htonl(out_dlen);
+        /*
         struct iovec iov[2];
         iov[0].iov_base = &msg_len;
         iov[0].iov_len = sizeof(uint32_t);
         iov[1].iov_base = out_data;
         iov[1].iov_len = out_dlen;
         rc = writev(ce->ra->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
+        */
+        queue_tcp_write_data(ce->ra, &msg_len, sizeof(uint32_t));
+        queue_tcp_write_data(ce->ra, out_data, out_dlen);        
 
-        // TODO: handle non blokcing write here
-        
     }
     else {
 	    rc = (int)sendto(sockfd, out_data, out_dlen, 0,
@@ -1074,7 +1160,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 	struct timeval timeo;
 	int sockfd, rc;
 	struct sockaddr_inx loc_addr;
-	fd_set rset;
+	fd_set rset, wset;
 	time_t last_walk;
 	char s_loc_addr[50];
 
@@ -1153,6 +1239,8 @@ int run_server(int tunfd, const char *loc_addr_pair)
 		FD_SET(sockfd, &rset);
         FD_SET(tcp_listen_fd, &rset);
 
+        FD_ZERO(&wset);
+
         int max_fd = max_of(tunfd, sockfd);
         max_fd = max_of(max_fd, tcp_listen_fd);
 
@@ -1161,6 +1249,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
             struct ra_entry *entry = NULL;
             list_for_each_entry(entry, &ra_entries_accepted_only, list) {
                 FD_SET(entry->client_fd, &rset);
+                FD_SET(entry->client_fd, &wset);
                 max_fd = max_of(max_fd, entry->client_fd);
 #if DEBUG            
                 fprintf(stderr, "Accepted only: add fd %d to set. max fd is %d\n", entry->client_fd, max_fd);
@@ -1177,6 +1266,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
             list_for_each_entry (re, chain, list) {
                 if (re->is_tcp) {
                    FD_SET(re->client_fd, &rset);
+                   FD_SET(re->client_fd, &wset);
                    max_fd = max_of(max_fd, re->client_fd);
 #if DEBUG            
             fprintf(stderr, "Connected client: add fd %d to set. max fd is %d\n", re->client_fd, max_fd);
@@ -1222,7 +1312,6 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #endif                           
                 }
             }
-
             // tcp client connections in ra_set
             for ( int i = 0; i < RA_SET_HASH_SIZE; i++ ) {
 
@@ -1231,7 +1320,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 
                 list_for_each_entry_safe (re, temp, chain, list) {
                     if (re->is_tcp) {
-                       if ( FD_ISSET(re->client_fd, &rset) ) {
+                       if ( re->refs > 0 && FD_ISSET(re->client_fd, &rset) ) {
 #if DEBUG
                           fprintf(stderr, "connected client fd %d ready to read\n", re->client_fd);
 #endif                    
@@ -1243,6 +1332,17 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #endif                    
                           }
                        }
+
+                       // writable
+                       if ( re->refs > 0 && FD_ISSET(re->client_fd, &wset) ) {
+                          int client_fd = re->client_fd;
+                          rc = write_queued_tcp_data_nonblocking(client_fd, re);
+                          if ( rc < 0 ) {
+#if DEBUG
+                             fprintf(stderr, "connected client fd %d network wrting failed.\n", client_fd);
+#endif                    
+                          }
+                       }
                     }
                 } // list
 
@@ -1251,7 +1351,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
             // tcp client connections in accepted only list
             struct ra_entry *entry, *temp;
             list_for_each_entry_safe(entry, temp, &ra_entries_accepted_only, list) {
-                 if ( FD_ISSET(entry->client_fd, &rset) ) {
+                 if ( entry->refs > 0 && FD_ISSET(entry->client_fd, &rset) ) {
 #if DEBUG
                     fprintf(stderr, "accepted client fd %d ready to read\n", entry->client_fd);
 #endif                    
@@ -1263,7 +1363,19 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #endif                    
                     }
                  }
+
+                 // Writable
+                 if ( entry->refs > 0 && FD_ISSET(entry->client_fd, &wset) ) {
+                    int client_fd = entry->client_fd;
+                    rc = write_queued_tcp_data_nonblocking(client_fd, entry);
+                    if ( rc < 0 ) {
+#if DEBUG
+                        fprintf(stderr, "accepted client fd %d writing failed.\n", client_fd);
+#endif                    
+                    }
+                 }
             } // all accepted only
+
 
         } // if select() > 0
 
