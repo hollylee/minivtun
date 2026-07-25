@@ -611,20 +611,24 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
         if ( re->client_fd >= 0 ) {
 
             uint32_t msg_len = htonl(out_len);
-            /*
+            
             struct iovec iov[2];
             iov[0].iov_base = &msg_len;
             iov[0].iov_len = sizeof(uint32_t);
             iov[1].iov_base = out_msg;
             iov[1].iov_len = out_len;
             rc = writev(re->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
-            */
+#if DEBUG
+            printf("ra_entry_keepalive write %zu to tcp fd %d\n", out_len, re->client_fd);
+#endif
+            
+            /*
             queue_tcp_write_data(re, &msg_len, sizeof(uint32_t));
             queue_tcp_write_data(re, out_msg, out_len);
-
 #if DEBUG
             printf("ra_entry_keepalive queue %zu to tcp fd %d for writing.\n", out_len, re->client_fd);
 #endif
+            */
         }
 
         rc = 1;
@@ -1103,9 +1107,6 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
 #if DEBUG
     dump_nmsg(&nmsg);
-
-	printf("out data:\n");
-	hexdump(out_data, out_dlen);
 #endif	
 
     if ( ce->ra->is_tcp ) {
@@ -1113,22 +1114,32 @@ static int tunnel_receiving(int tunfd, int sockfd)
         assert(ce->ra->client_fd >= 0);
 
         uint32_t msg_len = htonl(out_dlen);
-        /*
+        
         struct iovec iov[2];
         iov[0].iov_base = &msg_len;
         iov[0].iov_len = sizeof(uint32_t);
         iov[1].iov_base = out_data;
         iov[1].iov_len = out_dlen;
         rc = writev(ce->ra->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
-        */
+#if DEBUG
+        fprintf(stderr, "write to client tcp fd %d, %u bytes.\n", ce->ra->client_fd, out_dlen);
+#endif
+
+       /*
         queue_tcp_write_data(ce->ra, &msg_len, sizeof(uint32_t));
         queue_tcp_write_data(ce->ra, out_data, out_dlen);        
+
+        rc = 1;
+        */
 
     }
     else {
 	    rc = (int)sendto(sockfd, out_data, out_dlen, 0,
 		    		(struct sockaddr *)&ce->ra->real_addr,
 			    	sizeof_sockaddr(&ce->ra->real_addr));
+#if DEBUG
+        fprintf(stderr, "send to udp fd %d, %u bytes.\n", sockfd, out_dlen);
+#endif
     }
 
 	ce->last_xmit = current_ts;
