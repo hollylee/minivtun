@@ -1122,7 +1122,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
         iov[1].iov_len = out_dlen;
         rc = writev(ce->ra->client_fd, iov, sizeof(iov) / sizeof(struct iovec));
 #if DEBUG
-        fprintf(stderr, "write to client tcp fd %d, %u bytes.\n", ce->ra->client_fd, out_dlen);
+        fprintf(stderr, "write to client tcp fd %d, %zu bytes.\n", ce->ra->client_fd, out_dlen);
 #endif
 
        /*
@@ -1138,7 +1138,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 		    		(struct sockaddr *)&ce->ra->real_addr,
 			    	sizeof_sockaddr(&ce->ra->real_addr));
 #if DEBUG
-        fprintf(stderr, "send to udp fd %d, %u bytes.\n", sockfd, out_dlen);
+        fprintf(stderr, "send to udp fd %d, %zu bytes.\n", sockfd, out_dlen);
 #endif
     }
 
