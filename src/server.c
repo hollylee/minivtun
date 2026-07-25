@@ -675,7 +675,8 @@ static void va_ra_walk_continue(int sockfd)
 			list_for_each_entry_safe (re, __re, &ra_set_hbase[ra_index], list) {
 				if (current_ts - re->last_recv > config.reconnect_timeo) {
 					if (re->refs == 0) {
-                        if ( re->is_tcp )
+                        // Indeed I think when re->refs is zero the client_fd should already be closed.
+                        if ( re->is_tcp && re->client_fd >= 0 )
                            close_tcp_client(re);
 						ra_entry_release(re);
 					}
