@@ -1264,7 +1264,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
             struct ra_entry *re;
 
             list_for_each_entry (re, chain, list) {
-                if (re->is_tcp) {
+                if (re->is_tcp && re->client_fd >= 0) {
                    FD_SET(re->client_fd, &rset);
                    FD_SET(re->client_fd, &wset);
                    max_fd = max_of(max_fd, re->client_fd);
