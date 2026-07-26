@@ -155,6 +155,12 @@ int write_tcp_data_nonblocking(int fd)
     struct write_buffer_entry * entry = list_first_entry(&write_buffer_list, struct write_buffer_entry, list);
     assert(entry->offset < entry->buffer_len - 1);
 
+#if DEBUG
+    printf("Write out data from offset %zu, len %zu, total_len %zu: ", 
+           entry->offset, entry->buffer_len - entry->offset, entry->buffer_len);
+    hexdump(entry->buffer + entry->offset, entry->buffer_len - entry->offset);
+#endif
+
     // Write it.
     ssize_t written_size = 0;
     do {
@@ -188,6 +194,7 @@ int write_tcp_data_nonblocking(int fd)
         list_del(&(entry->list));
         free(entry);
     }
+
 
     return written_size;
 }

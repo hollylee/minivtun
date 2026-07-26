@@ -535,7 +535,7 @@ int write_queued_tcp_data_nonblocking(int fd, struct ra_entry * entry)
     ssize_t written_size = 0;
     do {
         written_size = write(fd, write_buffer->buffer + write_buffer->offset, write_buffer->buffer_len - write_buffer->offset);
-    } while (written_size == -1 && errno == EINTR);
+    } while (written_size < 0 && errno == EINTR);
 
     if ( written_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) )
        return 0;
@@ -1210,6 +1210,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 		fprintf(stderr, "*** socket() failed: %s.\n", strerror(errno));
 		exit(1);
 	}
+
 	if (bind(sockfd, (struct sockaddr *)&loc_addr, sizeof_sockaddr(&loc_addr)) < 0) {
 		fprintf(stderr, "*** bind() failed: %s.\n", strerror(errno));
 		exit(1);
@@ -1222,6 +1223,10 @@ int run_server(int tunfd, const char *loc_addr_pair)
         fprintf(stderr, "*** socket() to create tcp listening socket failed: %s\n", strerror(errno));
         exit(1);
     }
+
+    // set SO_REUSEADDR.
+    int reuseaddr_opt = 1;
+    setsockopt(tcp_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr_opt, sizeof(int));
 
     // Bind to tcp listening socket
     if ( bind(tcp_listen_fd, (struct sockaddr *)&loc_addr, sizeof_sockaddr(&loc_addr)) < 0 ) {
