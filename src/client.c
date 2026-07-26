@@ -523,7 +523,8 @@ static int tunnel_receiving(int tunfd, int sockfd)
         rc = 1;
 
 #if DEBUG
-        printf("queue write msg_len %zu\n", out_dlen);
+        printf("queue write msg_len %zu. data: \n", out_dlen);
+        hexdump(out_data, out_dlen);
 #endif
 
     }
@@ -603,6 +604,11 @@ static int peer_keepalive(int sockfd)
         */
         queue_writing_data((char *)&msg_len, sizeof(uint32_t));
         queue_writing_data((char *)out_msg, out_len);
+
+#if DEBUG
+        printf("queue keepalive data len %zu: ", out_len);
+        hexdump(out_msg, out_len);
+#endif
 
         rc = 1;
     }
