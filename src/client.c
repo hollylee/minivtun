@@ -221,6 +221,8 @@ int queue_writing_data(char * write_buffer, size_t write_len)
     list_add_tail(&(entry->list), &write_buffer_list);
 
 #if DEBUG
+    fprintf(stderr, "Queueing %zu bytes write_buffer: ", write_len);
+    hexdump(write_buffer);
     fprintf(stderr, "Queued %zu bytes buffer: ", entry->buffer_len);
     hexdump(entry->buffer, entry->buffer_len);
 #endif
@@ -609,12 +611,13 @@ static int peer_keepalive(int sockfd)
         rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
         */
         queue_writing_data((char *)&msg_len, sizeof(uint32_t));
-        queue_writing_data((char *)out_msg, out_len);
-
+        
 #if DEBUG
         printf("queue keepalive data len %zu: ", out_len);
         hexdump(out_msg, out_len);
 #endif
+
+        queue_writing_data((char *)out_msg, out_len);
 
         rc = 1;
     }
