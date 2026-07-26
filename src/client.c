@@ -219,6 +219,12 @@ int queue_writing_data(char * write_buffer, size_t write_len)
 
     // Add
     list_add_tail(&(entry->list), &write_buffer_list);
+
+#if DEBUG
+    fprintf(stderr, "Queued %zu bytes buffer: ");
+    hexdump(entry->buffer, entry->buffer_len);
+#endif
+
     return 0;
 }
 
