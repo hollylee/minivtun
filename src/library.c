@@ -69,6 +69,10 @@ static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
 		} \
 	} while(0)
 
+// Encrypt data in @param in with specified @param key. The @param cptype specified 
+// crypto type, which listed in cipher_pairs array above. The output is in @param out.
+// The @pram dlan contains data size in @param in in input time, and contains data size in 
+// @out in output.
 void datagram_encrypt(const void *key, const void *cptype, void *in,
 		void *out, size_t *dlen)
 {

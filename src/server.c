@@ -604,7 +604,7 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 
 	out_msg = crypt_buffer;
 	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
-	local_to_netmsg(nmsg, &out_msg, &out_len);
+	local_to_netmsg(nmsg, out_msg, &out_len);
 
     if ( re->is_tcp ) { // Exclude recycled 
 
@@ -905,7 +905,7 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
     // Decrypt payload. encrypted is in read_buffer, plain data is in nmsg, out_data(crypt_buffer) with length out_dlen
 	out_data = crypt_buffer;
 	out_dlen = (size_t)rc;
-	netmsg_to_local(read_buffer, &out_data, &out_dlen);
+	netmsg_to_local(read_buffer, out_data, &out_dlen);
 	nmsg = out_data;
 
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
@@ -1103,7 +1103,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	/* Do encryption. */
 	out_data = crypt_buffer;
 	out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
-	local_to_netmsg(&nmsg, &out_data, &out_dlen);
+	local_to_netmsg(&nmsg, out_data, &out_dlen);
 
 #if DEBUG
     dump_nmsg(&nmsg);

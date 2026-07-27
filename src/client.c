@@ -39,7 +39,7 @@ struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len,
 	// out_dlen = (size_t)rc;
 	out_dlen = data_len;
 	// netmsg_to_local(read_buffer, &out_data, &out_dlen);
-	netmsg_to_local(data_buffer, &out_data, &out_dlen);
+	netmsg_to_local(data_buffer, out_data, &out_dlen);
 	nmsg = out_data;
 
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
@@ -407,8 +407,8 @@ static int network_receiving(int tunfd, int sockfd)
 
 #endif // !__APPLE_NETWORK_EXTENSION__
 
-
-void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void ** out_data, size_t * out_dlen)
+// @param out_data. NM_PI_BUFFER_SIZE
+void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void * out_data, size_t * out_dlen)
 {
 	// char crypt_buffer[NM_PI_BUFFER_SIZE];
 	// void *out_data;
@@ -512,7 +512,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
     }
 #endif
 
-    _tunnel_data_handler(pi+1, ip_dlen, proto, &out_data, &out_dlen);
+    _tunnel_data_handler(pi+1, ip_dlen, proto, out_data, &out_dlen);
 
     if ( config.use_tcp ) {
         uint32_t msg_len = htonl(out_dlen);
@@ -558,7 +558,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
 #endif // __APPLE_NETWORK_EXTENSION__
 
-void _keepalive_make(void ** out_msg, size_t * out_len)
+void _keepalive_make(void * out_msg, size_t * out_len)
 {
 	char in_data[64]; //, crypt_buffer[64];
 	struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
@@ -597,7 +597,7 @@ static int peer_keepalive(int sockfd)
 	// out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	// local_to_netmsg(nmsg, &out_msg, &out_len);
 
-    _keepalive_make(&out_msg, &out_len);
+    _keepalive_make(out_msg, &out_len);
 
 	if ( config.use_tcp ) {
         uint32_t msg_len = htonl(out_len);

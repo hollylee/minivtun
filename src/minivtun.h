@@ -69,20 +69,25 @@ struct minivtun_msg {
 
 #define enabled_encryption()  (config.crypto_passwd[0])
 
-static inline void local_to_netmsg(void *in, void **out, size_t *dlen)
+// 
+static inline void local_to_netmsg(void *in, void *out, size_t *dlen)
 {
 	if (enabled_encryption()) {
-		datagram_encrypt(config.crypto_key, config.crypto_type, in, *out, dlen);
+		datagram_encrypt(config.crypto_key, config.crypto_type, in, out, dlen);
 	} else {
-		*out = in;
+		// *out = in;
+        memcpy(out, in, *dlen);
 	}
 }
-static inline void netmsg_to_local(void *in, void **out, size_t *dlen)
+
+// NOTE: if no encryption, *out will be set to in
+static inline void netmsg_to_local(void *in, void *out, size_t *dlen)
 {
 	if (enabled_encryption()) {
-		datagram_decrypt(config.crypto_key, config.crypto_type, in, *out, dlen);
+		datagram_decrypt(config.crypto_key, config.crypto_type, in, out, dlen);
 	} else {
-		*out = in;
+		// *out = in;
+        memcpy(out, in, *dlen);
 	}
 }
 
@@ -132,8 +137,8 @@ static inline void dump_nmsg(struct minivtun_msg * nmsg)
 
 
 struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len, void * out_buffer, struct tun_pi * ppi);
-void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void ** out_data, size_t * out_dlen);
-void _keepalive_make(void **, size_t *);
+void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void * out_data, size_t * out_dlen);
+void _keepalive_make(void *, size_t *);
 void set_config_params(const char * crypto_key);
 
 
