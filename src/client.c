@@ -793,7 +793,7 @@ int run_client(int tunfd, const char *peer_addr_pair)
 			FD_SET(sockfd, &rset);
 
         FD_ZERO(&wset);
-        if ( sockfd >= 0 )
+        if ( sockfd >= 0 && !list_empty(&write_buffer_list) )
            FD_SET(sockfd, &wset);
 
 		timeo.tv_sec = 2;

@@ -623,7 +623,7 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 #endif
             
             /*
-            queue_tcp_write_data(re, &msg_len, sizeof(uint32_t));
+            // queue_tcp_write_data(re, &msg_len, sizeof(uint32_t));
             queue_tcp_write_data(re, out_msg, out_len);
 #if DEBUG
             printf("ra_entry_keepalive queue %zu to tcp fd %d for writing.\n", out_len, re->client_fd);
@@ -1126,7 +1126,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 #endif
 
        /*
-        queue_tcp_write_data(ce->ra, &msg_len, sizeof(uint32_t));
+        // queue_tcp_write_data(ce->ra, &msg_len, sizeof(uint32_t));
         queue_tcp_write_data(ce->ra, out_data, out_dlen);        
 
         rc = 1;
