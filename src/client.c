@@ -109,7 +109,7 @@ int read_tcp_data_nonblocking(int fd, char * buffer, size_t * read_size, size_t 
 
     ssize_t read_bytes = 0;
     do {
-       read_bytes = read(fd, buffer, size_to_read);
+       read_bytes = read(fd, buffer + *read_size, size_to_read);
     } while ( read_bytes < 0 && errno == EINTR );
 
     if ( read_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) )
