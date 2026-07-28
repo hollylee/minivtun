@@ -205,16 +205,20 @@ int queue_writing_data(char * write_buffer, size_t write_len)
 {
     // Allocate
     struct write_buffer_entry * entry = 
-           (struct write_buffer_entry *)malloc(sizeof(struct write_buffer_entry) + write_len);
+           (struct write_buffer_entry *)malloc(sizeof(struct write_buffer_entry) + write_len + sizeof(uint32_t));
 
     if ( entry == NULL ) {
        return -1;        
     }
 
     // Fill
+    uint32_t msg_len = htonl(write_len);
+
     entry->buffer = (char *)(entry + 1);
-    memcpy(entry->buffer, write_buffer, write_len);
-    entry->buffer_len = write_len;
+    entry->buffer_len = write_len + sizeof(uint32_t);
+
+    *(uint32_t *)(entry->buffer) = msg_len;
+    memcpy(entry->buffer + sizeof(uint32_t), write_buffer, write_len);
     entry->offset = 0;
 
     // Add
@@ -515,7 +519,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
     _tunnel_data_handler(pi+1, ip_dlen, proto, out_data, &out_dlen);
 
     if ( config.use_tcp ) {
-        uint32_t msg_len = htonl(out_dlen);
+        // uint32_t msg_len = htonl(out_dlen);
         /*
         struct iovec iov[2];
         iov[0].iov_base = &msg_len;
@@ -525,7 +529,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
         rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
         */
-        queue_writing_data((char *)&msg_len, sizeof(uint32_t));
+        // queue_writing_data((char *)&msg_len, sizeof(uint32_t));
         queue_writing_data((char *)out_data, out_dlen);
 
         rc = 1;
@@ -600,7 +604,7 @@ static int peer_keepalive(int sockfd)
     _keepalive_make(out_msg, &out_len);
 
 	if ( config.use_tcp ) {
-        uint32_t msg_len = htonl(out_len);
+        // uint32_t msg_len = htonl(out_len);
         /*
         struct iovec iov[2];
         iov[0].iov_len = sizeof(uint32_t);
@@ -610,7 +614,7 @@ static int peer_keepalive(int sockfd)
 
         rc = writev(sockfd, iov, sizeof(iov) / sizeof(struct iovec));
         */
-        queue_writing_data((char *)&msg_len, sizeof(uint32_t));
+        // queue_writing_data((char *)&msg_len, sizeof(uint32_t));
 
 #if DEBUG
         printf("queue keepalive data len %zu: ", out_len);
