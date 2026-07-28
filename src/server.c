@@ -18,6 +18,7 @@
 #include <sys/uio.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include "list.h"
 #include "jhash.h"
@@ -1224,9 +1225,13 @@ int run_server(int tunfd, const char *loc_addr_pair)
         exit(1);
     }
 
-    // set SO_REUSEADDR.
+    // set SO_REUSEADDR to avoid bind() fail even if the program already exited but the endpoint still be hold.
     int reuseaddr_opt = 1;
     setsockopt(tcp_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr_opt, sizeof(int));
+
+    // Set TCP_NODELAY so that small packets (ours) can be sent immediately
+    int no_delay = 1;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(int));
 
     // Bind to tcp listening socket
     if ( bind(tcp_listen_fd, (struct sockaddr *)&loc_addr, sizeof_sockaddr(&loc_addr)) < 0 ) {

@@ -18,6 +18,7 @@
 #include <sys/uio.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include "minivtun.h"
 
@@ -646,11 +647,20 @@ static int try_resolve_and_connect(const char *peer_addr_pair, struct sockaddr_i
 		return rc;
 
     if ( config.use_tcp ) {
+        
         sockfd = socket(peer_addr->sa.sa_family, SOCK_STREAM, IPPROTO_TCP);
         if ( sockfd < 0 ) {
 		   fprintf(stderr, "*** socket(SOCK_STREAM) failed: %s.\n", strerror(errno));
 		   return -1;
         }
+
+        // set NODELAY. This is because our payload (13xx) is smaller than one MSS in outer TCP
+        // therefore the Nagle algorithm will delay it until previous ACK received, this requires 
+        // one RTT (e.g. 20ms). So the throughput is limited to 1000 / 20 ~= 50 * 13xx about 50KB/s.
+        // 
+        // Note we should set NODELAY in both side.
+        int no_delay = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(int));
     }
     else {
 	    if ((sockfd = socket(peer_addr->sa.sa_family, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
