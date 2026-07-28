@@ -568,15 +568,19 @@ int queue_tcp_write_data(struct ra_entry * entry, void * buffer, size_t buffer_l
 {
      // Allocate a tcp_write_buffer struct and the buffer inside
      struct tcp_write_buffer * write_buffer = 
-         (struct tcp_write_buffer *)malloc(sizeof(struct tcp_write_buffer) + buffer_len);
+         (struct tcp_write_buffer *)malloc(sizeof(struct tcp_write_buffer) + buffer_len + sizeof(uint32_t));
 
      if ( write_buffer == NULL )  
         return -1;
 
     // Fill the buffer
     write_buffer->buffer = (uint8_t *)(write_buffer + 1);
-    memcpy(write_buffer->buffer, buffer, buffer_len);
-    write_buffer->buffer_len = buffer_len;
+    write_buffer->buffer_len = buffer_len + sizeof(uint32_t);
+
+    uint32_t msg_len = htonl(buffer_len);    
+    *(uint32_t *)(write_buffer->buffer) = msg_len;
+
+    memcpy(write_buffer->buffer + sizeof(uint32_t), buffer, buffer_len);
     write_buffer->offset = 0;
 
     // link into the list in entry
@@ -610,7 +614,7 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
     if ( re->is_tcp ) { // Exclude recycled 
 
         if ( re->client_fd >= 0 ) {
-
+/*
             uint32_t msg_len = htonl(out_len);
             
             struct iovec iov[2];
@@ -622,14 +626,11 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 #if DEBUG
             printf("ra_entry_keepalive write %zu to tcp fd %d\n", out_len, re->client_fd);
 #endif
-            
-            /*
-            // queue_tcp_write_data(re, &msg_len, sizeof(uint32_t));
+*/            
             queue_tcp_write_data(re, out_msg, out_len);
 #if DEBUG
             printf("ra_entry_keepalive queue %zu to tcp fd %d for writing.\n", out_len, re->client_fd);
 #endif
-            */
         }
 
         rc = 1;
@@ -1113,7 +1114,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
     if ( ce->ra->is_tcp ) {
 
         assert(ce->ra->client_fd >= 0);
-
+/*
         uint32_t msg_len = htonl(out_dlen);
         
         struct iovec iov[2];
@@ -1125,13 +1126,17 @@ static int tunnel_receiving(int tunfd, int sockfd)
 #if DEBUG
         fprintf(stderr, "write to client tcp fd %d, %zu bytes.\n", ce->ra->client_fd, out_dlen);
 #endif
-
-       /*
+*/
+       
         // queue_tcp_write_data(ce->ra, &msg_len, sizeof(uint32_t));
         queue_tcp_write_data(ce->ra, out_data, out_dlen);        
 
+#if DEBUG
+        fprintf(stderr, "queue to client tcp fd %d, %zu bytes.\n", ce->ra->client_fd, out_dlen);
+#endif
+
         rc = 1;
-        */
+        
 
     }
     else {
@@ -1161,6 +1166,10 @@ int accept_connection(int listen_fd)
        return rv;
 
     set_nonblock(rv);
+
+    // Set TCP_NODELAY
+    int no_delay = 1;
+    setsockopt(rv, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(int));
 
     // Cannot create.
     if ( ra_create_accepted_only(&addr_in, rv) == NULL ) {
@@ -1229,15 +1238,12 @@ int run_server(int tunfd, const char *loc_addr_pair)
     int reuseaddr_opt = 1;
     setsockopt(tcp_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr_opt, sizeof(int));
 
-    // Set TCP_NODELAY so that small packets (ours) can be sent immediately
-    int no_delay = 1;
-    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(int));
-
     // Bind to tcp listening socket
     if ( bind(tcp_listen_fd, (struct sockaddr *)&loc_addr, sizeof_sockaddr(&loc_addr)) < 0 ) {
         fprintf(stderr, "*** bind() to bind tcp listening socket failed: %s\n", strerror(errno));
         exit(1);
     }
+
     set_nonblock(tcp_listen_fd);
 
     if ( listen(tcp_listen_fd, 128) < 0 ) {
@@ -1276,7 +1282,10 @@ int run_server(int tunfd, const char *loc_addr_pair)
             struct ra_entry *entry = NULL;
             list_for_each_entry(entry, &ra_entries_accepted_only, list) {
                 FD_SET(entry->client_fd, &rset);
-                FD_SET(entry->client_fd, &wset);
+
+                if ( !list_empty(&(entry->tcp_write_list)) )
+                   FD_SET(entry->client_fd, &wset);
+
                 max_fd = max_of(max_fd, entry->client_fd);
 #if DEBUG            
                 fprintf(stderr, "Accepted only: add fd %d to set. max fd is %d\n", entry->client_fd, max_fd);
@@ -1293,7 +1302,8 @@ int run_server(int tunfd, const char *loc_addr_pair)
             list_for_each_entry (re, chain, list) {
                 if (re->is_tcp && re->client_fd >= 0) {
                    FD_SET(re->client_fd, &rset);
-                   FD_SET(re->client_fd, &wset);
+                   if ( !list_empty(&(re->tcp_write_list)) )                   
+                      FD_SET(re->client_fd, &wset);
                    max_fd = max_of(max_fd, re->client_fd);
 #if DEBUG            
             fprintf(stderr, "Connected client: add fd %d to set. max fd is %d\n", re->client_fd, max_fd);
@@ -1305,7 +1315,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 		timeo.tv_sec = 2;
 		timeo.tv_usec = 0;
 
-		rc = select(max_fd + 1, &rset, NULL, NULL, &timeo);
+		rc = select(max_fd + 1, &rset, &wset, NULL, &timeo);
 		if ( rc < 0 && errno != EINTR ) {
 			fprintf(stderr, "*** select(): %s.\n", strerror(errno));
 			return -1;
