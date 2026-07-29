@@ -734,7 +734,7 @@ int _reconnect(int sockfd, const char * peer_addr_pair, struct sockaddr_inx * pe
 }
 
 
-#ifdef _linux_
+#ifdef __linux__
 
 struct in_addr _get_default_route()
 {
@@ -788,14 +788,14 @@ void set_client_routes(struct sockaddr_inx * peer_addr)
         // 1. Get current default gw - TODO: support IPv6 route...
         struct in_addr gw = _get_default_route();
         if ( gw.s_addr == INADDR_NONE ) {
-           fprintf("*** Cannot get default route. Exit\n");
+           fprintf(stderr,"*** Cannot get default route. Exit\n");
            exit(1);
         }
 
         // 2. Add one route to the server through this default route
         char command[256] = { 0 };
         char s_peer_addr[INET6_ADDRSTRLEN] = { 0 }, s_gw_addr[INET6_ADDRSTRLEN] = { 0 };
-		inet_ntop(peer_addr.sa.sa_family, addr_of_sockaddr(&peer_addr), s_peer_addr, sizeof(s_peer_addr));
+		inet_ntop(peer_addr->sa.sa_family, addr_of_sockaddr(peer_addr), s_peer_addr, sizeof(s_peer_addr));
         inet_ntop(AF_INET, &(gw.s_addr), s_gw_addr, sizeof(s_gw_addr));
 
         snprintf(command, 256, "ip route add -host %s gw %s", s_peer_addr, s_gw_addr);
