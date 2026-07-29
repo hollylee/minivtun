@@ -798,13 +798,13 @@ void set_client_routes(struct sockaddr_inx * peer_addr)
 		inet_ntop(peer_addr->sa.sa_family, addr_of_sockaddr(peer_addr), s_peer_addr, sizeof(s_peer_addr));
         inet_ntop(AF_INET, &(gw.s_addr), s_gw_addr, sizeof(s_gw_addr));
 
-        snprintf(command, 256, "ip route add -host %s gw %s", s_peer_addr, s_gw_addr);
+        snprintf(command, 256, "route add -host %s gw %s", s_peer_addr, s_gw_addr);
         printf("Running: %s\n", command);
         system(command);
 
         // 3. Add a new default route through tun interface. 
         inet_ntop(AF_INET, &config.local_tun_in.s_addr, s_gw_addr, sizeof(s_gw_addr));
-        snprintf(command, 256, "ip route add default gw %s", s_gw_addr);
+        snprintf(command, 256, "route add default gw %s", s_gw_addr);
         printf("Running: %s\n", command);
         system(command);
 #endif			
