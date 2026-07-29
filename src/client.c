@@ -748,8 +748,8 @@ struct in_addr _get_default_route()
     }
 
     char iface[64];
-    unsigned long dest, gateway;
-    int flags, refcnt, use, metric, mask, mtu, window, irtt;
+    unsigned long dest, gateway, mask;
+    int flags, refcnt, use, metric, mtu, window, irtt;
 
     // Skip header line
     char buf[256];
