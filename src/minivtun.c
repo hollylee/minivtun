@@ -244,6 +244,7 @@ static int try_resolve_addr_pair(const char *addr_pair)
 	return 0;
 }
 
+
 int main(int argc, char *argv[])
 {
 	const char *tun_ip_config = NULL, *tun_ip6_config = NULL;
@@ -393,14 +394,6 @@ int main(int argc, char *argv[])
 		// Run ifconfig
 		(void)system(cmd);
 
-		// Invoking route command to add default if config.send_all_traffic
-		if ( config.send_all_traffic ) {
-#ifdef __APPLE__
-           // 1. Add a ifscoped default route for current default
-#else
-           // TODO:
-#endif			
-		}
 	}
 
 	/* Configure IPv6 address if set. */

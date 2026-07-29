@@ -733,6 +733,86 @@ int _reconnect(int sockfd, const char * peer_addr_pair, struct sockaddr_inx * pe
     return sockfd;
 }
 
+
+#ifdef _linux_
+
+struct in_addr _get_default_route()
+{
+    struct in_addr gw;
+    gw.s_addr = INADDR_NONE;
+
+    FILE *fp = fopen("/proc/net/route", "r");
+    if (!fp) {
+        fprintf(stderr, "*** Cannot open /proc/net/route.\n");
+        return gw;
+    }
+
+    char iface[64];
+    unsigned long dest, gateway;
+    int flags, refcnt, use, metric, mask, mtu, window, irtt;
+
+    // Skip header line
+    char buf[256];
+    fgets(buf, sizeof(buf), fp);
+
+    while (fscanf(fp, "%63s %lx %lx %X %d %d %d %lx %d %d %d\n",
+                  iface, &dest, &gateway, &flags, &refcnt, &use,
+                  &metric, &mask, &mtu, &window, &irtt) == 11) {
+        if (dest == 0) {  // default route
+            gw.s_addr = gateway;
+            printf("Get Default gateway: %s (iface: %s)\n", inet_ntoa(gw), iface);
+            break;
+        }
+    }
+
+    fclose(fp);
+    return gw;    
+}
+
+
+#endif // __linux__
+
+// Set routes for the client
+static
+void set_client_routes(struct sockaddr_inx * peer_addr)
+{
+     // Invoking route command to add default if config. NOTE send_all_traffic is available in client only.
+	 if ( config.send_all_traffic ) {
+#ifdef __APPLE__
+        // 1. Get current default route
+        // 2. Add a ifscoped default route for current default
+        // 3. Add a route targeting to the server through current default
+        // 4. Remove the global current default route
+        // 5. Add new global current default route pointing to the utun interface
+#else
+        // 1. Get current default gw - TODO: support IPv6 route...
+        struct in_addr gw = _get_default_route();
+        if ( gw.s_addr == INADDR_NONE ) {
+           fprintf("*** Cannot get default route. Exit\n");
+           exit(1);
+        }
+
+        // 2. Add one route to the server through this default route
+        char command[256] = { 0 };
+        char s_peer_addr[INET6_ADDRSTRLEN] = { 0 }, s_gw_addr[INET6_ADDRSTRLEN] = { 0 };
+		inet_ntop(peer_addr.sa.sa_family, addr_of_sockaddr(&peer_addr), s_peer_addr, sizeof(s_peer_addr));
+        inet_ntop(AF_INET, &(gw.s_addr), s_gw_addr, sizeof(s_gw_addr));
+
+        snprintf(command, 256, "ip route add -host %s gw %s", s_peer_addr, s_gw_addr);
+        printf("Running: %s\n", command);
+        system(command);
+
+        // 3. Add a new default route through tun interface. 
+        inet_ntop(AF_INET, &config.local_tun_in.s_addr, s_gw_addr, sizeof(s_gw_addr));
+        snprintf(command, 256, "ip route add default gw %s", s_gw_addr);
+        printf("Running: %s\n", command);
+        system(command);
+#endif			
+     }
+
+} // set_client_routes
+
+
 // The entry. Called from main() in minivtun.c directly after ifconfig interfaces
 //
 // @param peer_addr_pair:  <remote-host>:<port>
@@ -752,6 +832,8 @@ int run_client(int tunfd, const char *peer_addr_pair)
 				  s_peer_addr, sizeof(s_peer_addr));
 		printf("Mini virtual tunnelling client to %s:%u, interface: %s, bind to address %s\n",
 				s_peer_addr, ntohs(port_of_sockaddr(&peer_addr)), config.devname, config.bind_to_addr);
+
+        set_client_routes(&peer_addr);
 
 	} else if (sockfd == -EAGAIN && config.wait_dns) {
 

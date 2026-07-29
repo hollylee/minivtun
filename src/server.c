@@ -1181,6 +1181,21 @@ int accept_connection(int listen_fd)
     return rv;
 }
 
+// Set net.ipv4.ip_forward through /proc/sys/net/ipv4/ip_forward
+static 
+int set_ipv4_forward()
+{
+    static const char * filename = "/proc/sys/net/ipv4/ip_forward";
+    FILE * fp = fopen(filename, "w");
+    if ( fp == NULL )
+       return -1;
+
+    fprintf(fp, "1");
+    fclose(fp);
+
+    return 0;
+}
+
 // The server's entry function
 int run_server(int tunfd, const char *loc_addr_pair)
 {
@@ -1199,6 +1214,12 @@ int run_server(int tunfd, const char *loc_addr_pair)
     assert(!bool_equal(true, false));
     assert(!bool_equal(false, true));
 #endif
+
+    // Enable sysctl net.ipv4.ip_forward
+    if ( set_ipv4_forward() < 0 ) {
+        fprintf(stderr, "*** Cannot set net.ipv4.ip_forward. Exit\n");
+        return -1;
+    }
 
     // 
 	if (get_sockaddr_inx_pair(loc_addr_pair, &loc_addr) < 0) {
