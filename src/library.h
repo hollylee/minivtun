@@ -219,10 +219,10 @@ struct name_cipher_pair {
 
 extern struct name_cipher_pair cipher_pairs[];
 const void *get_crypto_type(const char *name);
-void datagram_encrypt(const void *key, const void *cptype, void *in,
-		void *out, size_t *dlen);
-void datagram_decrypt(const void *key, const void *cptype, void *in,
-		void *out, size_t *dlen);
+void datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
+		void *out, size_t out_buffer_len, size_t *dlen);
+void datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
+		void *out, size_t out_buffer_len, size_t *dlen);
 void fill_with_string_md5sum(const char *in, void *out, size_t outlen);
 
 /* =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= */

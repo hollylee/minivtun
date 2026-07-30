@@ -86,8 +86,9 @@ static struct in_addr *vt_route_lookup(const struct in_addr *addr)
 
 	for (i = 0; i < vt_routes_len; i++) {
 		struct vt_route *rt = vt_routes[i];
-		
+#if DEBUG		
 		printf("0x%08x,0x%08x,0x%08x\n", addr->s_addr, rt->netmask.s_addr, rt->network.s_addr);
+#endif        
 		if ((addr->s_addr & rt->netmask.s_addr) == rt->network.s_addr)
 			return &rt->gateway;
 	}
@@ -102,8 +103,8 @@ struct ra_entry {
 
 	struct list_head list; // link inside the ra_set_hbase hash table entry.
 	struct sockaddr_inx real_addr; // The real address of the client
-	time_t last_recv;
-	time_t last_xmit;
+	time_t last_recv; // Also used this field to store accepted time in accepted only list.
+	time_t last_xmit; // Also set to the accepted time in accepted only list.
     int refs; // Maintains the reference count of current usage. ra_get_or_create will increase it and ra_put_no_free will decrease it
 
     // TCP transport only
@@ -179,6 +180,9 @@ static struct ra_entry * ra_create_accepted_only(const struct sockaddr_inx * sa,
     re->tcp_msg_len = 0;
     INIT_LIST_HEAD(&(re->tcp_write_list));
 
+    // Set to the create time.
+    re->last_recv = re->last_xmit = time(NULL);
+
 	list_add_tail(&re->list, &ra_entries_accepted_only);
 	ra_entries_accepted_only_len++;
 
@@ -224,6 +228,9 @@ static struct ra_entry *ra_get_or_create(const struct sockaddr_inx *sa, bool is_
 
     INIT_LIST_HEAD(&(re->tcp_write_list));
 
+    // Set to the create time.
+    re->last_recv = re->last_xmit = time(NULL);
+
 	list_add_tail(&re->list, chain);
 	ra_set_len++;
 
@@ -256,6 +263,13 @@ static inline void ra_entry_release_accepted_only(struct ra_entry *re)
 	inet_ntop(re->real_addr.sa.sa_family, addr_of_sockaddr(&re->real_addr), s_real_addr, sizeof(s_real_addr));
 	printf("Released client [%s:%u] from accepted only. clients: %u\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), ra_set_len);
 
+    // Clean write list
+    while ( !list_empty(&(re->tcp_write_list)) ) {
+        struct tcp_write_buffer * write_buffer = list_first_entry(&(re->tcp_write_list), struct tcp_write_buffer, list);
+        list_del(&(write_buffer->list));
+        free(write_buffer);
+    }
+
 	free(re);
 }
 
@@ -274,6 +288,13 @@ static inline void ra_entry_release(struct ra_entry *re)
 			  s_real_addr, sizeof(s_real_addr));
 	printf("Recycled client [%s:%u]. %s. clients: %u\n", s_real_addr, ntohs(port_of_sockaddr(&re->real_addr)), 
         re->is_tcp ? "tcp" : "udp", ra_set_len);
+
+    // Clean write list
+    while ( !list_empty(&(re->tcp_write_list)) ) {
+        struct tcp_write_buffer * write_buffer = list_first_entry(&(re->tcp_write_list), struct tcp_write_buffer, list);
+        list_del(&(write_buffer->list));
+        free(write_buffer);
+    }
 
 	free(re);
 }
@@ -466,7 +487,7 @@ static struct tun_client *tun_client_get_or_create(
         // Have this virtual address.
 		if (tun_addr_comp(&ce->virt_addr, vaddr) == 0) {
 
-			if ( !is_sockaddr_equal(&ce->ra->real_addr, raddr) || !bool_equal(ce->ra->is_tcp >= 0, tcp_client_fd >= 0) ){
+			if ( !is_sockaddr_equal(&ce->ra->real_addr, raddr) || !bool_equal(ce->ra->is_tcp, tcp_client_fd >= 0) ){
 				/* Real address changed, reassign a new entry for it. */
 				ra_put_no_free(ce->ra);
 				if ((ce->ra = ra_get_or_create(raddr, tcp_client_fd >= 0, tcp_client_fd)) == NULL) {
@@ -516,6 +537,17 @@ void close_tcp_client(struct ra_entry * re)
      assert(re->client_fd >= 0 && re->is_tcp);
      close(re->client_fd);
      re->client_fd = -1;
+}
+
+static
+void close_and_clear_tcp_client(struct ra_entry * entry)
+{
+     close_tcp_client(entry);
+
+     if ( entry->accepted_only )
+        ra_entry_release_accepted_only(entry);
+     else
+        tun_client_release_for_re(entry);
 }
 
 // Write data to a nonblocking tcp fd.
@@ -608,8 +640,8 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 	nmsg->keepalive.loc_tun_in6 = config.local_tun_in6;
 
 	out_msg = crypt_buffer;
-	out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
-	local_to_netmsg(nmsg, out_msg, &out_len);
+	size_t keepalive_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
+	local_to_netmsg(nmsg, 64, keepalive_len, out_msg, 64, &out_len);
 
     if ( re->is_tcp ) { // Exclude recycled 
 
@@ -700,6 +732,24 @@ static void va_ra_walk_continue(int sockfd)
 		} while (ra_count < ra_walk_max && ra_index != __ra_index);
 	}
 
+    /* Recycle idle ra_entries in accepted only list */
+    if ( ra_entries_accepted_only_len > 0 ) {
+
+        list_for_each_entry_safe(re, __re, &ra_entries_accepted_only, list) {
+
+            if ( current_ts - re->last_recv > config.reconnect_timeo ) {
+                close_tcp_client(re);
+		        ra_entry_release_accepted_only(re);
+            }
+            else if ( current_ts - re->last_xmit > config.keepalive_timeo ) {
+                ra_entry_keepalive(re, sockfd);
+            }
+
+        }
+
+    }
+
+
 	printf("Online clients: %u, addresses: %u, accept only: %u\n", ra_set_len, va_map_len, 
            ra_entries_accepted_only_len);
 }
@@ -753,18 +803,24 @@ int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset
     if ( read_size > 0 ) {
        *buffer_offset += read_size;
        if ( *buffer_offset >= whole_len ) {
+#if DEBUG        
           fprintf(stderr, "client fd %d read %zd bytes. offset %zu whole %zu. All read in\n", client_fd, read_size, *buffer_offset, whole_len);
+#endif          
           return 1;
        }
        else {
+#if DEBUG        
           fprintf(stderr, "client fd %d read %zd bytes. offset %zu whole %zu. more data\n", client_fd, read_size, *buffer_offset, whole_len);
+#endif          
           return 0;
        }
     }
 
     // EOF
     if ( read_size == 0 ) {
+#if DEBUG        
        fprintf(stderr, "read() on client fd %d EOF (peer disconnected)\n", client_fd);
+#endif       
        return -1;
     }
 
@@ -777,14 +833,18 @@ int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset
        getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len);
        
        //
+#if DEBUG       
        fprintf(stderr, "read() on client fd %d read_size %zd (errno %d), getsockopt get error %d, more data?\n", 
                client_fd, read_size, errno, socket_error);       
+#endif               
 
        return 0;
     }
 
     // Other errors
+#if DEBUG    
     fprintf(stderr, "read() on client fd %d failed %s\n", client_fd, strerror(errno));
+#endif    
     return -1;
 }
 
@@ -792,6 +852,9 @@ int read_tcp_client_data(int client_fd, uint8_t * buffer, size_t * buffer_offset
 //
 // re == NULL: udp
 // re != NULL: tcp
+//
+// @return <0 if read fail in tcp and the the client would be cleared.
+//.        otherwise == 0.
 static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
 {
 	char read_buffer[NM_PI_BUFFER_SIZE], crypt_buffer[NM_PI_BUFFER_SIZE];
@@ -829,13 +892,7 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
 #if DEBUG          
              fprintf(stderr, "tcp client fd %d closed due to read msg_len error\n", entry->client_fd);
 #endif          
-             close_tcp_client(entry);
-
-             if ( entry->accepted_only )
-                ra_entry_release_accepted_only(entry);
-             else
-                tun_client_release_for_re(entry);
-
+             close_and_clear_tcp_client(entry);
              return -1;
           }
 
@@ -851,6 +908,18 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
           printf("network_receiving: received msg_len %d\n", entry->tcp_msg_len);
 #endif
 
+          // Verify tcp_msg_len value
+          if ( entry->tcp_msg_len == 0 || entry->tcp_msg_len > NM_PI_BUFFER_SIZE ) {
+
+#if DEBUG
+          printf("network_receiving: msg_len %u is invalid. A corrupted connection?\n", entry->tcp_msg_len);
+#endif
+             close_and_clear_tcp_client(entry);
+
+             return -1;
+
+          }
+
           return 0;
 
        } // read msg_len
@@ -862,11 +931,7 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
 #if DEBUG          
           fprintf(stderr, "tun tcp client fd %d closed due to read net_msg error\n", entry->client_fd);
 #endif          
-          close_tcp_client(entry);
-          if ( entry->accepted_only )
-             ra_entry_release_accepted_only(entry);
-          else 
-             tun_client_release_for_re(entry);
+          close_and_clear_tcp_client(entry);
           return -1;
        }
 
@@ -906,8 +971,8 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
 
     // Decrypt payload. encrypted is in read_buffer, plain data is in nmsg, out_data(crypt_buffer) with length out_dlen
 	out_data = crypt_buffer;
-	out_dlen = (size_t)rc;
-	netmsg_to_local(read_buffer, out_data, &out_dlen);
+	// out_dlen = (size_t)rc;
+	netmsg_to_local(read_buffer, NM_PI_BUFFER_SIZE, rc, out_data, NM_PI_BUFFER_SIZE, &out_dlen);
 	nmsg = out_data;
 
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
@@ -918,8 +983,7 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
  #endif
 
 	/* Verify password. */
-	if (memcmp(nmsg->hdr.auth_key, config.crypto_key,
-		sizeof(nmsg->hdr.auth_key)) != 0)
+	if (memcmp(nmsg->hdr.auth_key, config.crypto_key, sizeof(nmsg->hdr.auth_key)) != 0)
 		return 0;
 
 	switch (nmsg->hdr.opcode) {
@@ -985,7 +1049,9 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
 		iov[0].iov_len = sizeof(pi);
 		iov[1].iov_base = (char *)nmsg + MINIVTUN_MSG_IPDATA_OFFSET;
 		iov[1].iov_len = ip_dlen;
-		rc = (int)writev(tunfd, iov, 2);
+
+        // Ignore the returned value of writev. If write to tunfd failed, let's think the packet is lost.
+		writev(tunfd, iov, 2);
 
 #ifdef DEBUG
         printf("Write to tun: ");
@@ -1010,25 +1076,27 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	unsigned short af = 0;
 	struct tun_addr virt_addr;
 	struct tun_client *ce;
-	int rc;
+	// int rc;
 
-	rc = (int)read(tunfd, pi, NM_PI_BUFFER_SIZE);
+	ssize_t read_size = read(tunfd, pi, NM_PI_BUFFER_SIZE);
+    if ( read_size < 0 ) {
+#if DEBUG
+       fprintf(stderr, "tunnel_receiving: read tunfd %d error: %zd\n", tunfd, read_size);
+#endif        
+       return -1;
+    }
+
 #if DEBUG	
-	if ( rc < 0 ) {
-	   perror("read");
-	   abort();
-	}
-
     printf("tunnel_receiving:\n");
-	hexdump(read_buffer, rc);
+	hexdump(read_buffer, read_size);
 #endif
 
-	if (rc < sizeof(struct tun_pi))
-		return 0;
+	if ((size_t)read_size < sizeof(struct tun_pi))
+		return -1;
 
 	// osx_af_to_ether(&pi->proto);
 
-	ip_dlen = (size_t)rc - sizeof(struct tun_pi);
+	ip_dlen = (size_t)read_size - sizeof(struct tun_pi);
 
 	/* We only accept IPv4 or IPv6 frames. */
 	/*
@@ -1104,8 +1172,8 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
 	/* Do encryption. */
 	out_data = crypt_buffer;
-	out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
-	local_to_netmsg(&nmsg, out_data, &out_dlen);
+	size_t in_data_len = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
+	local_to_netmsg(&nmsg, NM_PI_BUFFER_SIZE, in_data_len, out_data, NM_PI_BUFFER_SIZE, &out_dlen);
 
 #if DEBUG
     dump_nmsg(&nmsg);
@@ -1135,18 +1203,24 @@ static int tunnel_receiving(int tunfd, int sockfd)
         fprintf(stderr, "queue to client tcp fd %d, %zu bytes.\n", ce->ra->client_fd, out_dlen);
 #endif
 
-        rc = 1;
-        
-
     }
     else {
-	    rc = (int)sendto(sockfd, out_data, out_dlen, 0,
+	    ssize_t send_size = sendto(sockfd, out_data, out_dlen, 0,
 		    		(struct sockaddr *)&ce->ra->real_addr,
 			    	sizeof_sockaddr(&ce->ra->real_addr));
+
+        if ( send_size < 0 ) {
 #if DEBUG
-        fprintf(stderr, "send to udp fd %d, %zu bytes.\n", sockfd, out_dlen);
+           fprintf(stderr, "send to udp fd %d, %zu bytes failed: %zd.\n", sockfd, out_dlen, send_size);
 #endif
-    }
+        }
+        else {
+#if DEBUG
+           fprintf(stderr, "send to udp fd %d, %zu bytes.\n", sockfd, out_dlen);
+#endif
+        }
+
+    } // udp
 
 	ce->last_xmit = current_ts;
 	ce->ra->last_xmit = current_ts;
@@ -1352,16 +1426,21 @@ int run_server(int tunfd, const char *loc_addr_pair)
             // The udp socket to clients
 			if (FD_ISSET(sockfd, &rset)) {
 				rc = network_receiving(tunfd, sockfd, NULL);
+                if ( rc < 0 )
+                   continue;
 			}
+
             // tun fd. The socket to receive outside packets
 			if (FD_ISSET(tunfd, &rset)) {
 				rc = tunnel_receiving(tunfd, sockfd); //
 			}
+
             // tcp listen socket
             if (FD_ISSET(tcp_listen_fd, &rset)) {
                 rc = accept_connection(tcp_listen_fd);
                 if (rc < 0) {
                    fprintf(stderr, "accept() failed: %s\n", strerror(errno));
+                   continue;
                 }
                 else {
 #if DEBUG                   
@@ -1370,6 +1449,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #endif                           
                 }
             }
+
             // tcp client connections in ra_set
             for ( int i = 0; i < RA_SET_HASH_SIZE; i++ ) {
 
@@ -1388,6 +1468,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #if DEBUG
                              fprintf(stderr, "connected client fd %d network receiving failed. Clear\n", client_fd);
 #endif                    
+                             continue;
                           }
                        }
 
@@ -1399,6 +1480,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #if DEBUG
                              fprintf(stderr, "connected client fd %d network wrting failed.\n", client_fd);
 #endif                    
+                             continue;
                           }
                        }
                     }
@@ -1409,6 +1491,7 @@ int run_server(int tunfd, const char *loc_addr_pair)
             // tcp client connections in accepted only list
             struct ra_entry *entry, *temp;
             list_for_each_entry_safe(entry, temp, &ra_entries_accepted_only, list) {
+
                  if ( entry->refs > 0 && FD_ISSET(entry->client_fd, &rset) ) {
 #if DEBUG
                     fprintf(stderr, "accepted client fd %d ready to read\n", entry->client_fd);
@@ -1419,7 +1502,13 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #if DEBUG
                         fprintf(stderr, "accepted client fd %d network receiving failed.\n", client_fd);
 #endif                    
+                       continue;
                     }
+
+                    // If rc == 0, the entry should already be removed from accept-only list and be released. (A new 
+                    // tun_client then would be created, also in network_receiving.)
+                    // So we cannot fall through to writing check below, as the entry is already be release.
+                    continue;
                  }
 
                  // Writable
@@ -1430,8 +1519,10 @@ int run_server(int tunfd, const char *loc_addr_pair)
 #if DEBUG
                         fprintf(stderr, "accepted client fd %d writing failed.\n", client_fd);
 #endif                    
+                       continue;
                     }
                  }
+
             } // all accepted only
 
 
@@ -1442,7 +1533,8 @@ int run_server(int tunfd, const char *loc_addr_pair)
 			va_ra_walk_continue(sockfd);
 			last_walk = current_ts;
 		}
-	}
+
+	} // for 
 
 	return 0;
 }

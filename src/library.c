@@ -59,13 +59,17 @@ static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
 	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
 };
 
-#define CRYPTO_DATA_PADDING(data, dlen, bs) \
+#define CRYPTO_DATA_PADDING(data, data_buffer_len, data_len, out_len, bs) \
 	do { \
-		size_t last_len = *(dlen) % (bs); \
+        *out_len = data_len; \
+		size_t last_len = (data_len) % (bs); \
 		if (last_len) { \
 			size_t padding_len = bs - last_len; \
-			memset((char *)data + *(dlen), 0x0, padding_len); \
-			*(dlen) += padding_len; \
+            *(out_len) = data_len; \
+            if ( data_len + padding_len <= data_buffer_len) { \
+			   memset((char *)data + *(out_len), 0x0, padding_len); \
+			   *(out_len) += padding_len; \
+            } \
 		} \
 	} while(0)
 
@@ -73,8 +77,8 @@ static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
 // crypto type, which listed in cipher_pairs array above. The output is in @param out.
 // The @pram dlan contains data size in @param in in input time, and contains data size in 
 // @out in output.
-void datagram_encrypt(const void *key, const void *cptype, void *in,
-		void *out, size_t *dlen)
+void datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
+		void *out, size_t out_buffer_len, size_t *dlen)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
 	EVP_CIPHER_CTX * ctx;
@@ -85,7 +89,7 @@ void datagram_encrypt(const void *key, const void *cptype, void *in,
 		iv_len = 16;
 
 	memcpy(iv, crypto_ivec_initdata, iv_len);
-	CRYPTO_DATA_PADDING(in, dlen, iv_len);
+	CRYPTO_DATA_PADDING(in, in_buffer_len, in_data_len, dlen, iv_len);
 	ctx = EVP_CIPHER_CTX_new();
 	assert(EVP_EncryptInit_ex(ctx, cptype, NULL, key, iv));
 	EVP_CIPHER_CTX_set_padding(ctx, 0);
@@ -96,8 +100,8 @@ void datagram_encrypt(const void *key, const void *cptype, void *in,
 	*dlen = (size_t)(outl + outl2);
 }
 
-void datagram_decrypt(const void *key, const void *cptype, void *in,
-		void *out, size_t *dlen)
+void datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len, 
+		void *out, size_t out_buffer_len, size_t *dlen)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
 	EVP_CIPHER_CTX * ctx;
@@ -108,7 +112,7 @@ void datagram_decrypt(const void *key, const void *cptype, void *in,
 		iv_len = 16;
 
 	memcpy(iv, crypto_ivec_initdata, iv_len);
-	CRYPTO_DATA_PADDING(in, dlen, iv_len);
+	CRYPTO_DATA_PADDING(in, in_buffer_len, in_data_len, dlen, iv_len);
 	ctx = EVP_CIPHER_CTX_new();
 	assert(EVP_DecryptInit_ex(ctx, cptype, NULL, key, iv));
 	EVP_CIPHER_CTX_set_padding(ctx, 0);

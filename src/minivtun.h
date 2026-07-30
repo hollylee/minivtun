@@ -9,6 +9,7 @@
 
 #include "library.h"
 
+#include <assert.h>
 #include <net/if.h>
 
 extern struct minivtun_config config;
@@ -69,25 +70,38 @@ struct minivtun_msg {
 
 #define enabled_encryption()  (config.crypto_passwd[0])
 
-// 
-static inline void local_to_netmsg(void *in, void *out, size_t *dlen)
+// Convert data to what would be sent out to the transport
+//
+// @param in. The input buffer
+// @param in_buffer_len. The whole input buffer langth, >= data len
+// @param in_data_len. The input data len <= in_buffer_len
+// @param out. The out buffer
+// @param out_buffer_len. The whole output buffer length. 
+// @param out_data_len. The data length in output buffer. <= out_buffer_len. This ths the output param.
+static inline void local_to_netmsg(void *in, size_t in_buffer_len, size_t in_data_len, 
+                                   void *out, size_t out_buffer_len, size_t *out_data_len)
 {
 	if (enabled_encryption()) {
-		datagram_encrypt(config.crypto_key, config.crypto_type, in, out, dlen);
+		datagram_encrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_buffer_len, out_data_len);
 	} else {
 		// *out = in;
-        memcpy(out, in, *dlen);
+        assert(out_buffer_len >= in_data_len);
+        memcpy(out, in, in_data_len);
+        *out_data_len = in_data_len;
 	}
 }
 
 // NOTE: if no encryption, *out will be set to in
-static inline void netmsg_to_local(void *in, void *out, size_t *dlen)
+static inline void netmsg_to_local(void *in, size_t in_buffer_len, size_t in_data_len, 
+                                   void *out, size_t out_buffer_len, size_t *out_data_len)
 {
 	if (enabled_encryption()) {
-		datagram_decrypt(config.crypto_key, config.crypto_type, in, out, dlen);
+		datagram_decrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_buffer_len, out_data_len);
 	} else {
 		// *out = in;
-        memcpy(out, in, *dlen);
+        assert(out_buffer_len >= in_data_len);
+        memcpy(out, in, in_data_len);
+        *out_data_len = in_data_len;
 	}
 }
 
@@ -136,9 +150,14 @@ static inline void dump_nmsg(struct minivtun_msg * nmsg)
 #endif // DEBUG
 
 
-struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len, void * out_buffer, struct tun_pi * ppi);
-void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void * out_data, size_t * out_dlen);
-void _keepalive_make(void *, size_t *);
+struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_buffer_len, size_t data_len, 
+                                            void * out_buffer, size_t out_buffer_len, struct tun_pi * ppi);
+
+void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void * out_data, 
+                          size_t out_buffer_len, size_t * out_dlen);
+
+void _keepalive_make(void * out_msg, size_t out_buffer_len, size_t * out_data_len);
+
 void set_config_params(const char * crypto_key);
 
 

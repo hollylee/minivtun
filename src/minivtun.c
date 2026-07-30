@@ -96,7 +96,7 @@ static void print_help(int argc, char *argv[])
 	printf("  -d, --daemon                        run as daemon process\n");
 	printf("  -f, --send-all-traffic              send all traffic through the tunnel\n");
 	printf("  -b, --bind-to-addr <addr>           bind to specified address. If omitted, would be bound to the address with the first default route.");
-	printf("  -T, --use-tcp                       Use tcp transport instead of udp. (client only)");
+	printf("  -T, --use-tcp                       Use tcp transport instead of udp. (client only. server will ignore it.)");
 	printf("  -h, --help                          print this help\n");
 	printf("Supported encryption types:\n");
 	printf("  ");
@@ -187,7 +187,8 @@ static int tun_alloc(char *dev)
 	memset(&ifr, 0, sizeof(ifr));
 	ifr.ifr_flags = IFF_TUN;
 	if (dev[0])
-		strncpy(ifr.ifr_name, dev, IFNAMSIZ);
+		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
+
 	if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
 		close(fd);
 		return err;
@@ -250,7 +251,7 @@ int main(int argc, char *argv[])
 	const char *tun_ip_config = NULL, *tun_ip6_config = NULL;
 	const char *loc_addr_pair = NULL, *peer_addr_pair = NULL;
 	const char *crypto_type = CRYPTO_DEFAULT_ALGORITHM;
-	char cmd[128];
+	char cmd[256];
 	int tunfd, opt;
 
 	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:b:dwhfT",
@@ -348,7 +349,14 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "*** Invalid IPv4 address pair: %s.\n", tun_ip_config);
 			exit(1);
 		}
+
+        if ( sp - tun_ip_config >= 20 ) {
+			fprintf(stderr, "*** Invalid IPv4 address pair: %s.\n", tun_ip_config);
+			exit(1);
+        }
+
 		strncpy(s_lip, tun_ip_config, sp - tun_ip_config);
+
 		s_lip[sp - tun_ip_config] = '\0';
 		sp++;
 		strncpy(s_rip, sp, sizeof(s_rip));
@@ -364,9 +372,9 @@ int main(int argc, char *argv[])
 		if (inet_pton(AF_INET, s_rip, &vaddr)) {
 			struct in_addr __network = { .s_addr = 0 };
 #ifdef __APPLE__
-			sprintf(cmd, "ifconfig %s %s %s", config.devname, s_lip, s_rip);
+			snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s", config.devname, s_lip, s_rip);
 #else
-			sprintf(cmd, "ifconfig %s %s pointopoint %s", config.devname, s_lip, s_rip);
+			snprintf(cmd, sizeof(cmd), "ifconfig %s %s pointopoint %s", config.devname, s_lip, s_rip);
 #endif
 			vt_route_add(&__network, 0, &vaddr);
 		} 
@@ -375,14 +383,14 @@ int main(int argc, char *argv[])
 			uint32_t mask = ~((1 << (32 - pfxlen)) - 1);
 #ifdef __APPLE__
 			uint32_t network = ntohl(vaddr.s_addr) & mask;
-			sprintf(s_rip, "%u.%u.%u.%u", network >> 24, (network >> 16) & 0xff,
+			snprintf(s_rip, sizeof(s_rip), "%u.%u.%u.%u", network >> 24, (network >> 16) & 0xff,
 					(network >> 8) & 0xff, network & 0xff);
-			sprintf(cmd, "ifconfig %s %s %s && route add -net %s/%d %s >/dev/null",
+			snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s && route add -net %s/%d %s >/dev/null",
 					config.devname, s_lip, s_lip, s_rip, pfxlen, s_lip);
 #else
-			sprintf(s_rip, "%u.%u.%u.%u", mask >> 24, (mask >> 16) & 0xff,
+			snprintf(s_rip, sizeof(s_rip), "%u.%u.%u.%u", mask >> 24, (mask >> 16) & 0xff,
 					(mask >> 8) & 0xff, mask & 0xff);
-			sprintf(cmd, "ifconfig %s %s netmask %s", config.devname, s_lip, s_rip);
+			snprintf(cmd, sizeof(cmd), "ifconfig %s %s netmask %s", config.devname, s_lip, s_rip);
 #endif
 		} 
 		else {
@@ -423,15 +431,15 @@ int main(int argc, char *argv[])
 		}
 
 #ifdef __APPLE__
-		sprintf(cmd, "ifconfig %s inet6 %s/%d", config.devname, s_lip, pfxlen);
+		snprintf(cmd, sizeof(cmd), "ifconfig %s inet6 %s/%d", config.devname, s_lip, pfxlen);
 #else
-		sprintf(cmd, "ifconfig %s add %s/%d", config.devname, s_lip, pfxlen);
+		snprintf(cmd, sizeof(cmd), "ifconfig %s add %s/%d", config.devname, s_lip, pfxlen);
 #endif
 		(void)system(cmd);
 	}
 
 	/* Always bring it up with proper MTU size. */
-	sprintf(cmd, "ifconfig %s mtu %u; ifconfig %s up", config.devname, config.tun_mtu, config.devname);
+	snprintf(cmd, sizeof(cmd), "ifconfig %s mtu %u; ifconfig %s up", config.devname, config.tun_mtu, config.devname);
 	(void)system(cmd);
 
 	if (enabled_encryption()) {

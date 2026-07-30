@@ -30,7 +30,8 @@
 static time_t last_recv = 0, last_keepalive = 0, current_ts = 0;
 
 // This would be called by both network_receiving() and NE codes 
-struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len, void * out_buffer, struct tun_pi * ppi)
+struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_buffer_len, size_t data_len, 
+                                            void * out_buffer, size_t out_buffer_len, struct tun_pi * ppi)
 {
 	void *out_data;
 	size_t ip_dlen, out_dlen;
@@ -38,9 +39,9 @@ struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_len,
 	
 	out_data = out_buffer;
 	// out_dlen = (size_t)rc;
-	out_dlen = data_len;
+	// out_dlen = data_len;
 	// netmsg_to_local(read_buffer, &out_data, &out_dlen);
-	netmsg_to_local(data_buffer, out_data, &out_dlen);
+	netmsg_to_local(data_buffer, data_buffer_len, data_len, out_data, out_buffer_len, &out_dlen);
 	nmsg = out_data;
 
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
@@ -154,7 +155,7 @@ int write_tcp_data_nonblocking(int fd)
         return 0;
 
     struct write_buffer_entry * entry = list_first_entry(&write_buffer_list, struct write_buffer_entry, list);
-    assert(entry->offset < entry->buffer_len - 1);
+    assert(entry->offset < entry->buffer_len);
 
 #if DEBUG
     printf("Write out data from offset %zu, len %zu, total_len %zu: ", 
@@ -191,11 +192,11 @@ int write_tcp_data_nonblocking(int fd)
     entry->offset += written_size;
     assert(entry->offset <= entry->buffer_len);
 
+    // All data in this entry is consumed.
     if ( entry->offset == entry->buffer_len ) {
         list_del(&(entry->list));
         free(entry);
     }
-
 
     return written_size;
 }
@@ -249,6 +250,13 @@ void clear_writing_queue()
     assert(list_empty(&write_buffer_list));
 }
 
+// For non-blokcing tcp reading
+static char tcp_read_buffer[NM_PI_BUFFER_SIZE] = { 0 };
+static size_t tcp_read_buffer_len = 0;
+static size_t tcp_msg_len = 0; // == 0 means we should read msg_len, otherwise read net_msg data
+
+
+
 // Handling packets received from Internet.
 //
 // < 0 error. Should reconnect.
@@ -263,11 +271,6 @@ static int network_receiving(int tunfd, int sockfd)
 	socklen_t real_peer_alen;
 	struct iovec iov[2];
 	int rc;
-
-    // For non-blokcing tcp reading
-    static char tcp_read_buffer[NM_PI_BUFFER_SIZE] = { 0 };
-    static size_t tcp_read_buffer_len = 0;
-    static size_t tcp_msg_len = 0; // == 0 means we should read msg_len, otherwise read net_msg data
 
     if ( config.use_tcp ) {
 
@@ -293,6 +296,15 @@ static int network_receiving(int tunfd, int sockfd)
 #if DEBUG
            fprintf(stderr, "Read msg_len %zu from sockfd %d\n", tcp_msg_len, sockfd);
 #endif 
+
+           // Verify tcp_msg_len. Treat an illegal value as an error.
+           if ( tcp_msg_len == 0 || tcp_msg_len > NM_PI_BUFFER_SIZE ) {
+#if DEBUG
+           fprintf(stderr, "Bad msg_len %zu. Thought it about a corrupt connection", tcp_msg_len);
+#endif 
+               return -1;
+
+           }
 
            return 0;
 
@@ -336,7 +348,7 @@ static int network_receiving(int tunfd, int sockfd)
 		return 0;
 
     // nmsg is not null for real IP data only.
-	nmsg = _network_data_handler(read_buffer, rc, crypt_buffer, &pi);
+	nmsg = _network_data_handler(read_buffer, NM_PI_BUFFER_SIZE, rc, crypt_buffer, NM_PI_BUFFER_SIZE, &pi);
 
 #if DEBUG
     if ( nmsg == 0 )
@@ -353,9 +365,8 @@ static int network_receiving(int tunfd, int sockfd)
 		rc = (int)writev(tunfd, iov, 2);
 #if DEBUG
         printf("write to tunnel. return %d\n", rc);
-		if ( rc < 0 )
-		   perror("writev");
 #endif		
+        // Ignore the return value of writev. It is OK.
 	}
 
 	return 0;
@@ -413,7 +424,8 @@ static int network_receiving(int tunfd, int sockfd)
 #endif // !__APPLE_NETWORK_EXTENSION__
 
 // @param out_data. NM_PI_BUFFER_SIZE
-void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void * out_data, size_t * out_dlen)
+void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, void * out_data, 
+                          size_t out_buffer_len, size_t * out_dlen)
 {
 	// char crypt_buffer[NM_PI_BUFFER_SIZE];
 	// void *out_data;
@@ -433,8 +445,8 @@ void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, v
 	// out_data = crypt_buffer;
 	// out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
 	// local_to_netmsg(&nmsg, &out_data, &out_dlen);	
-	*out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + data_len;
-	local_to_netmsg(&nmsg, out_data, out_dlen);
+	size_t in_data_len = MINIVTUN_MSG_IPDATA_OFFSET + data_len;
+	local_to_netmsg(&nmsg, sizeof(nmsg), in_data_len, out_data, out_buffer_len, out_dlen);
 }
 
 
@@ -449,14 +461,18 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	// struct minivtun_msg nmsg;
 	void *out_data;
 	size_t ip_dlen, out_dlen;
-	int rc;
+    ssize_t read_size = 0;
 
-	rc = (int)read(tunfd, pi, NM_PI_BUFFER_SIZE);
-	if (rc < sizeof(struct tun_pi))
+	read_size = read(tunfd, pi, NM_PI_BUFFER_SIZE);
+	if (read_size < 0 || (size_t)read_size < sizeof(struct tun_pi)) {
+#if DEBUG
+       fprintf(stderr, "read from tun fd %d failed: %zd\n", tunfd, read_size);
+#endif
 		return -1;
+    }
 
     //
-	ip_dlen = (size_t)rc - sizeof(struct tun_pi);
+	ip_dlen = (size_t)read_size - sizeof(struct tun_pi);
 
 	/* We only accept IPv4 or IPv6 frames. */
 	uint16_t proto = get_ether_proto_from_pi(pi);
@@ -498,7 +514,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
         uint32_t to_ip = *(uint32_t *)((uint8_t *)(pi + 1) + 16);
         inet_ntop(AF_INET, &to_ip, to_addr, INET_ADDRSTRLEN + 1);
 
-        printf("Read %d bytes from tunnel. from %s to %s\n", rc, from_addr, to_addr);
+        printf("Read %zd bytes from tunnel. from %s to %s\n", read_size, from_addr, to_addr);
 
     }
     else if ( proto == ETH_P_IPV6 ) {
@@ -512,12 +528,12 @@ static int tunnel_receiving(int tunfd, int sockfd)
         uint8_t * to_ip = (uint8_t *)(pi + 1) + 24;
         inet_ntop(AF_INET6, to_ip, to_addr, INET6_ADDRSTRLEN + 1);
 
-        printf("Read %d bytes from tunnel. from %s to %s\n", rc, from_addr, to_addr);
+        printf("Read %zd bytes from tunnel. from %s to %s\n", read_size, from_addr, to_addr);
 
     }
 #endif
 
-    _tunnel_data_handler(pi+1, ip_dlen, proto, out_data, &out_dlen);
+    _tunnel_data_handler(pi+1, ip_dlen, proto, out_data, NM_PI_BUFFER_SIZE, &out_dlen);
 
     if ( config.use_tcp ) {
         // uint32_t msg_len = htonl(out_dlen);
@@ -533,22 +549,27 @@ static int tunnel_receiving(int tunfd, int sockfd)
         // queue_writing_data((char *)&msg_len, sizeof(uint32_t));
         queue_writing_data((char *)out_data, out_dlen);
 
-        rc = 1;
-
 #if DEBUG
-        printf("queue write msg_len %zu. data: \n", out_dlen);
+        printf("tunnel_receiving: queue write msg_len %zu. data: \n", out_dlen);
         hexdump(out_data, out_dlen);
 #endif
 
     }
     else {
-	    rc = (int)send(sockfd, out_data, out_dlen, 0);
-    }
-
+	    ssize_t send_size = send(sockfd, out_data, out_dlen, 0);
+        if ( send_size < 0 ) {
 #if DEBUG
-    printf("tunnel -> network: %zu bytes\n", out_dlen);
-    hexdump(out_data, out_dlen);
+           fprintf(stderr, "tunnel_receiving: failed to send %zu bytes to udp fd %d\n", out_dlen, sockfd);
+#endif             
+        }
+        else {
+#if DEBUG
+           printf("tunnel -> network: %zu bytes\n", out_dlen);
+           hexdump(out_data, out_dlen);
 #endif	
+        }
+
+    } // udp
 
 
 	/**
@@ -563,7 +584,7 @@ static int tunnel_receiving(int tunfd, int sockfd)
 
 #endif // __APPLE_NETWORK_EXTENSION__
 
-void _keepalive_make(void * out_msg, size_t * out_len)
+void _keepalive_make(void * out_msg, size_t out_buffer_len, size_t * out_len)
 {
 	char in_data[64]; //, crypt_buffer[64];
 	struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
@@ -575,9 +596,9 @@ void _keepalive_make(void * out_msg, size_t * out_len)
 	nmsg->keepalive.loc_tun_in6 = config.local_tun_in6;
 
 	// out_msg = crypt_buffer;
-	*out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
+	size_t in_data_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	// local_to_netmsg(nmsg, &out_msg, &out_len);
-	local_to_netmsg(nmsg, out_msg, out_len);
+	local_to_netmsg(nmsg, 64, in_data_len, out_msg, out_buffer_len, out_len);
 }
 
 #ifndef __APPLE_NETWORK_EXTENSION__
@@ -602,7 +623,7 @@ static int peer_keepalive(int sockfd)
 	// out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	// local_to_netmsg(nmsg, &out_msg, &out_len);
 
-    _keepalive_make(out_msg, &out_len);
+    _keepalive_make(out_msg, 64, &out_len);
 
 	if ( config.use_tcp ) {
         // uint32_t msg_len = htonl(out_len);
@@ -696,13 +717,17 @@ static int try_resolve_and_connect(const char *peer_addr_pair, struct sockaddr_i
 		  return -EADDRNOTAVAIL;
 	   }
 	}
-	// 
-
+	
+    // 
 	if (connect(sockfd, (struct sockaddr *)peer_addr, sizeof_sockaddr(peer_addr)) < 0) {
 		close(sockfd);
 		return -EAGAIN;
 	}
 	set_nonblock(sockfd);
+
+    // Reset nonblocking read states
+    tcp_msg_len = 0;
+    tcp_read_buffer_len = 0;
 
 	return sockfd;
 }
@@ -713,22 +738,22 @@ int _reconnect(int sockfd, const char * peer_addr_pair, struct sockaddr_inx * pe
 {
 	char s_peer_addr[50];
 
-			if (sockfd >= 0)
-				close(sockfd);
+	if (sockfd >= 0)
+		close(sockfd);
 
-			do {
-				if ((sockfd = try_resolve_and_connect(peer_addr_pair, peer_addr)) < 0) {
-					fprintf(stderr, "Unable to connect to '%s', retrying.\n", peer_addr_pair);
-					sleep(5);
-				}
-			} while (sockfd < 0);
+	do {
+	   if ((sockfd = try_resolve_and_connect(peer_addr_pair, peer_addr)) < 0) {
+		  fprintf(stderr, "Unable to connect to '%s', retrying.\n", peer_addr_pair);
+    	  sleep(5);
+	   }
+	} while (sockfd < 0);
 
-			last_keepalive = 0;
-			last_recv = current_ts;
+	last_keepalive = 0;
+	last_recv = current_ts;
 
-			inet_ntop(peer_addr->sa.sa_family, addr_of_sockaddr(peer_addr), s_peer_addr,
+	inet_ntop(peer_addr->sa.sa_family, addr_of_sockaddr(peer_addr), s_peer_addr,
 					  sizeof(s_peer_addr));
-			printf("Reconnected to %s:%u. socket %d\n", s_peer_addr, ntohs(port_of_sockaddr(peer_addr)), sockfd);
+	printf("Reconnected to %s:%u. socket %d\n", s_peer_addr, ntohs(port_of_sockaddr(peer_addr)), sockfd);
 
     return sockfd;
 }
@@ -753,7 +778,10 @@ struct in_addr _get_default_route()
 
     // Skip header line
     char buf[256];
-    fgets(buf, sizeof(buf), fp);
+    if ( fgets(buf, sizeof(buf), fp) == NULL ) {
+       fprintf(stderr, "*** Read /proc/net/route failed\n");
+       return gw;
+    }
 
     while (fscanf(fp, "%63s %lx %lx %X %d %d %d %lx %d %d %d\n",
                   iface, &dest, &gateway, &flags, &refcnt, &use,
@@ -952,8 +980,8 @@ reconnect:
 		}
 
 		if (FD_ISSET(tunfd, &rset)) {
-			rc = tunnel_receiving(tunfd, sockfd);
-			assert(rc == 0);
+			tunnel_receiving(tunfd, sockfd);
+			// assert(rc == 0);
 		}
 
         // socket is writable
