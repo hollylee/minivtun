@@ -76,9 +76,9 @@ static void get_addrs_from_rtm(struct rt_msghdr2 * rtm, struct sockaddr * rti_in
 
 #ifdef __linux__
 
-static void get_attrs_from_rtmsg(struct nlmsghdr * hdr, struct rtmsg * rtm, struct rtattr * attrs[RTA_MAX])
+static void get_attrs_from_rtmsg(struct nlmsghdr * hdr, struct rtmsg * rtm, struct rtattr * attrs[RTA_MAX + 1])
 {
-       memset(attrs, 0, RTA_MAX * sizeof(struct rtattr *));
+       memset(attrs, 0, (RTA_MAX + 1) * sizeof(struct rtattr *));
 
        int attrs_len = RTM_PAYLOAD(hdr);
        for ( struct rtattr * attr = RTM_RTA(rtm); RTA_OK(attr, attrs_len); attr = RTA_NEXT(attr, attrs_len) ) {
@@ -128,7 +128,7 @@ int get_interface_of_ip_addr(struct sockaddr_in * addr_in, char * ifname, size_t
         if ( ifa->ifa_addr != 0 && ifa->ifa_addr->sa_family == AF_INET && 
              ((struct sockaddr_in *)(ifa->ifa_addr))->sin_addr.s_addr == addr_in->sin_addr.s_addr ) {
 
-           strncpy(ifname, ifa->ifa_name, ifname_len);
+           strncpy(ifname, ifa->ifa_name, ifname_len - 1);
            rv = 0;
            break;
 
@@ -176,7 +176,7 @@ struct route_table_req {
     struct rtmsg    rtm;
 };
 
-// The return value must ve released by free()
+// The return value must be released by free()
 static struct nlmsghdr * get_route_table(size_t * size)
 {
         int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -205,14 +205,20 @@ static struct nlmsghdr * get_route_table(size_t * size)
         size_t received_bufsize = 1024 * 64;
         size_t received_size = 0;
         char * received_buf = (char *)malloc(received_bufsize);
+        if (received_buf == NULL) {
+           close(s);
+           return NULL;
+        }
+
         char * p = received_buf;
     
         while ( received_size < received_bufsize ) {
     
               // receive
               rv = recv(s, p, received_bufsize - received_size, 0);
-              if ( rv < 0 ) {
+              if ( rv <= 0 ) { // error or nothing read in
                  close(s);
+                 free(received_buf);
                  return 0;
               }
     
@@ -292,7 +298,7 @@ int get_default_route_interface(char * ifname, size_t ifname_len)
            if ( if_indextoname(rtm->rtm_index, if_name) == 0 )
               continue;
 
-           strncpy(ifname, if_name, ifname_len);
+           strncpy(ifname, if_name, ifname_len - 1);
 
            //
            has_default_route = 1;
@@ -371,6 +377,7 @@ static int is_ip_in_default_route(struct sockaddr_in * addr_in)
 
 #ifdef __linux__
 
+// < 0 if error 
 int get_default_route_interface(char * ifname, size_t ifname_len)
 {
     // Get route table
@@ -391,7 +398,7 @@ int get_default_route_interface(char * ifname, size_t ifname_len)
            continue;
 
         // Get attributes        
-        struct rtattr * attrs[RTA_MAX];
+        struct rtattr * attrs[RTA_MAX + 1];
         get_attrs_from_rtmsg(hdr, rtmsg, attrs);
 
         // Linux has a RTA_GATEWAY attribute without dest addr to identify the default route
@@ -405,10 +412,11 @@ int get_default_route_interface(char * ifname, size_t ifname_len)
 
            // Get interface name of the default route
            char if_name[IFNAMSIZ] = { 0 };
-           if ( if_indextoname(*(unsigned int *)RTA_DATA(attrs[RTA_OIF]), if_name) == 0 )
+           if ( attrs[RTA_OIF] == NULL || if_indextoname(*(unsigned int *)RTA_DATA(attrs[RTA_OIF]), if_name) == 0 )
               continue;
 
            strncpy(ifname, if_name, ifname_len);
+           ifname[ifname_len - 1] = 0;
 
            //
            has_default_route = 1;
@@ -445,7 +453,7 @@ int is_ip_in_default_route(struct sockaddr_in * addr_in)
            continue;
 
         // Get destination and mask part
-        struct rtattr * attrs[RTA_MAX];
+        struct rtattr * attrs[RTA_MAX + 1];
 
         get_attrs_from_rtmsg(hdr, rtmsg, attrs);
 
@@ -454,7 +462,7 @@ int is_ip_in_default_route(struct sockaddr_in * addr_in)
         
            // Get interface name of the default route
            char ifname[IFNAMSIZ] = { 0 };
-           if ( if_indextoname(*(unsigned int *)RTA_DATA(attrs[RTA_OIF]), ifname) == 0 )
+           if ( attrs[RTA_OIF] == NULL || if_indextoname(*(unsigned int *)RTA_DATA(attrs[RTA_OIF]), ifname) == 0 )
               continue;
 
            // Get ip address for the interface

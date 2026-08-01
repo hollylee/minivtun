@@ -741,6 +741,8 @@ int _reconnect(int sockfd, const char * peer_addr_pair, struct sockaddr_inx * pe
 	if (sockfd >= 0)
 		close(sockfd);
 
+    clear_writing_queue();
+
 	do {
 	   if ((sockfd = try_resolve_and_connect(peer_addr_pair, peer_addr)) < 0) {
 		  fprintf(stderr, "Unable to connect to '%s', retrying.\n", peer_addr_pair);
@@ -920,7 +922,11 @@ int run_client(int tunfd, const char *peer_addr_pair)
 		timeo.tv_usec = 0;
 
 		rc = select((tunfd > sockfd ? tunfd : sockfd) + 1, &rset, &wset, NULL, &timeo);
+
 		if (rc < 0) {
+            if ( errno == EINTR ) 
+               continue;
+
 			fprintf(stderr, "*** select(): %s.\n", strerror(errno));
 			return -1;
 		}
@@ -999,7 +1005,6 @@ reconnect:
             // If writing failed, should we reconnect it or wait for rset?
             if ( rv < 0 ) {
 				fprintf(stderr, "Connection went bad due to writing failure. About to reconnect.\n");
-                clear_writing_queue();
 				goto reconnect;                
             }
         } // if writable

@@ -414,8 +414,10 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "*** Invalid IPv6 address pair: %s.\n", tun_ip6_config);
 			exit(1);
 		}
-		strncpy(s_lip, tun_ip6_config, sp - tun_ip6_config);
-		s_lip[sp - tun_ip6_config] = '\0';
+
+        size_t copy_len = min_of(sp - tun_ip6_config, sizeof(s_lip));
+		strncpy(s_lip, tun_ip6_config, copy_len);
+		s_lip[sizeof(s_lip) - 1] = '\0';
 		sp++;
 		strncpy(s_pfx, sp, sizeof(s_pfx));
 		s_pfx[sizeof(s_pfx) - 1] = '\0';
@@ -453,6 +455,10 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "*** WARNING: Transmission will not be encrypted.\n");
 	}
 
+    // Ignore SIGPIPE caused from write() to no reader fd.
+    signal(SIGPIPE, SIG_IGN);
+
+    // Start
 	if (loc_addr_pair) {
 		run_server(tunfd, loc_addr_pair);
 	} else if (peer_addr_pair) {

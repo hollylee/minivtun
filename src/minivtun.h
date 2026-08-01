@@ -82,7 +82,8 @@ static inline void local_to_netmsg(void *in, size_t in_buffer_len, size_t in_dat
                                    void *out, size_t out_buffer_len, size_t *out_data_len)
 {
 	if (enabled_encryption()) {
-		datagram_encrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_buffer_len, out_data_len);
+		if ( datagram_encrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_data_len) < 0 )
+           *out_data_len = 0;
 	} else {
 		// *out = in;
         assert(out_buffer_len >= in_data_len);
@@ -96,7 +97,8 @@ static inline void netmsg_to_local(void *in, size_t in_buffer_len, size_t in_dat
                                    void *out, size_t out_buffer_len, size_t *out_data_len)
 {
 	if (enabled_encryption()) {
-		datagram_decrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_buffer_len, out_data_len);
+		if ( datagram_decrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_data_len) < 0 )
+           *out_data_len = 0;
 	} else {
 		// *out = in;
         assert(out_buffer_len >= in_data_len);

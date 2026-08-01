@@ -25,9 +25,9 @@
 struct name_cipher_pair cipher_pairs[] = {
 	{ "aes-128", EVP_aes_128_cbc, },
 	{ "aes-256", EVP_aes_256_cbc, },
-	{ "des", EVP_des_cbc, },
-	{ "desx", EVP_desx_cbc, },
-	{ "rc4", EVP_rc4, },
+	// { "des", EVP_des_cbc, },
+	// { "desx", EVP_desx_cbc, },
+	// { "rc4", EVP_rc4, },
 	{ NULL, NULL, },
 };
 
@@ -65,7 +65,6 @@ static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
 		size_t last_len = (data_len) % (bs); \
 		if (last_len) { \
 			size_t padding_len = bs - last_len; \
-            *(out_len) = data_len; \
             if ( data_len + padding_len <= data_buffer_len) { \
 			   memset((char *)data + *(out_len), 0x0, padding_len); \
 			   *(out_len) += padding_len; \
@@ -73,12 +72,9 @@ static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
 		} \
 	} while(0)
 
-// Encrypt data in @param in with specified @param key. The @param cptype specified 
-// crypto type, which listed in cipher_pairs array above. The output is in @param out.
-// The @pram dlan contains data size in @param in in input time, and contains data size in 
-// @out in output.
-void datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
-		void *out, size_t out_buffer_len, size_t *dlen)
+// return 0 if succeeded. -1 if failed
+int datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
+		             void *out, size_t *out_len)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
 	EVP_CIPHER_CTX * ctx;
@@ -88,39 +84,68 @@ void datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_b
 	if (iv_len == 0)
 		iv_len = 16;
 
+    *out_len = 0;
+
 	memcpy(iv, crypto_ivec_initdata, iv_len);
-	CRYPTO_DATA_PADDING(in, in_buffer_len, in_data_len, dlen, iv_len);
+
 	ctx = EVP_CIPHER_CTX_new();
-	assert(EVP_EncryptInit_ex(ctx, cptype, NULL, key, iv));
-	EVP_CIPHER_CTX_set_padding(ctx, 0);
-	assert(EVP_EncryptUpdate(ctx, out, &outl, in, (int)*dlen));
-	assert(EVP_EncryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2));
+    if ( ctx == NULL )
+       return -1;
+
+    int succeeded = EVP_EncryptInit_ex(ctx, cptype, NULL, key, iv) && EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    if ( succeeded ) {
+       int block_size = EVP_CIPHER_CTX_block_size(ctx);
+	   CRYPTO_DATA_PADDING(in, in_buffer_len, in_data_len, out_len, block_size);
+	   succeeded = EVP_EncryptUpdate(ctx, out, &outl, in, (int)*out_len) &&
+	               EVP_EncryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2);
+    }
+        
 	EVP_CIPHER_CTX_free(ctx);
 
-	*dlen = (size_t)(outl + outl2);
+    if ( succeeded )
+	    *out_len = (size_t)(outl + outl2);
+
+    return succeeded ? 0 : -1;
 }
 
-void datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len, 
-		void *out, size_t out_buffer_len, size_t *dlen)
+// Return 0 if succeeded, -1 if failed
+int datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len, 
+		void *out, size_t *out_len)
 {
 	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
 	EVP_CIPHER_CTX * ctx;
 	unsigned char iv[CRYPTO_MAX_KEY_SIZE];
 	int outl = 0, outl2 = 0;
 
+    *out_len = 0;
+
 	if (iv_len == 0)
 		iv_len = 16;
 
 	memcpy(iv, crypto_ivec_initdata, iv_len);
-	CRYPTO_DATA_PADDING(in, in_buffer_len, in_data_len, dlen, iv_len);
+
 	ctx = EVP_CIPHER_CTX_new();
-	assert(EVP_DecryptInit_ex(ctx, cptype, NULL, key, iv));
-	EVP_CIPHER_CTX_set_padding(ctx, 0);
-	assert(EVP_DecryptUpdate(ctx, out, &outl, in, (int)*dlen));
-	assert(EVP_DecryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2));
+    if ( ctx == NULL ) 
+       return -1;
+
+	int succeeded = EVP_DecryptInit_ex(ctx, cptype, NULL, key, iv) &&
+	                EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    if ( succeeded ) {
+       int block_size = EVP_CIPHER_CTX_block_size(ctx);
+       // *dlen == input data length after padding
+	   CRYPTO_DATA_PADDING(in, in_buffer_len, in_data_len, out_len, block_size);
+       succeeded = EVP_DecryptUpdate(ctx, out, &outl, in, (int)*out_len) &&
+	               EVP_DecryptFinal_ex(ctx, (unsigned char *)out + outl, &outl2);
+    }
+
 	EVP_CIPHER_CTX_free(ctx);
 
-	*dlen = (size_t)(outl + outl2);
+    if ( succeeded )
+       *out_len = (size_t)(outl + outl2);
+
+	return succeeded ? 0 : -1;
 }
 
 void fill_with_string_md5sum(const char *in, void *out, size_t outlen)
@@ -191,7 +216,7 @@ int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
 		sscanf(pair, "%d", &port);
 		strcpy(host, "0.0.0.0");
 	}
-	sprintf(s_port, "%d", port);
+	snprintf(s_port, 10, "%d", port);
 	if (port <= 0 || port > 65535)
 		return -EINVAL;
 

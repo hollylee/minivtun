@@ -33,6 +33,7 @@
 	(type *)((char *)__mptr - offsetof(type, member)); })
 
 #define max_of(v1, v2)   ((v1) > (v2) ? (v1) : (v2))
+#define min_of(v1, v2)   ((v1) > (v2) ? (v2) : (v1))
 
 #ifndef ETH_P_IP
 	#define ETH_P_IP 0x0800 /* Internet Protocol packet */
@@ -219,17 +220,17 @@ struct name_cipher_pair {
 
 extern struct name_cipher_pair cipher_pairs[];
 const void *get_crypto_type(const char *name);
-void datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
-		void *out, size_t out_buffer_len, size_t *dlen);
-void datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
-		void *out, size_t out_buffer_len, size_t *dlen);
+int datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
+		void *out, size_t *dlen);
+int datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
+		void *out, size_t *dlen);
 void fill_with_string_md5sum(const char *in, void *out, size_t outlen);
 
 /* =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= */
 
 static inline int set_nonblock(int sockfd)
 {
-	if (fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFD, 0)|O_NONBLOCK) == -1)
+	if (fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0)|O_NONBLOCK) == -1)
 		return -1;
 	return 0;
 }
