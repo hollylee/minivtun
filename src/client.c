@@ -41,7 +41,8 @@ struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_buff
 	// out_dlen = (size_t)rc;
 	// out_dlen = data_len;
 	// netmsg_to_local(read_buffer, &out_data, &out_dlen);
-	netmsg_to_local(data_buffer, data_buffer_len, data_len, out_data, out_buffer_len, &out_dlen);
+	netmsg_to_local(enabled_encryption(), config.crypto_key, config.crypto_type, 
+                    data_buffer, data_buffer_len, data_len, out_data, out_buffer_len, &out_dlen);
 	nmsg = out_data;
 
 	if (out_dlen < MINIVTUN_MSG_BASIC_HLEN)
@@ -446,7 +447,8 @@ void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, v
 	// out_dlen = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
 	// local_to_netmsg(&nmsg, &out_data, &out_dlen);	
 	size_t in_data_len = MINIVTUN_MSG_IPDATA_OFFSET + data_len;
-	local_to_netmsg(&nmsg, sizeof(nmsg), in_data_len, out_data, out_buffer_len, out_dlen);
+	local_to_netmsg(enabled_encryption(), config.crypto_key, config.crypto_type, &nmsg, sizeof(nmsg), 
+                    in_data_len, out_data, out_buffer_len, out_dlen);
 }
 
 
@@ -598,7 +600,8 @@ void _keepalive_make(void * out_msg, size_t out_buffer_len, size_t * out_len)
 	// out_msg = crypt_buffer;
 	size_t in_data_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	// local_to_netmsg(nmsg, &out_msg, &out_len);
-	local_to_netmsg(nmsg, 64, in_data_len, out_msg, out_buffer_len, out_len);
+	local_to_netmsg(enabled_encryption(), config.crypto_key, config.crypto_type, in_data, 64, in_data_len, 
+                    out_msg, out_buffer_len, out_len);
 }
 
 #ifndef __APPLE_NETWORK_EXTENSION__
@@ -607,7 +610,7 @@ void _keepalive_make(void * out_msg, size_t out_buffer_len, size_t * out_len)
 static int peer_keepalive(int sockfd)
 {
 	// char in_data[64], crypt_buffer[64];
-	char crypt_buffer[64];
+	char crypt_buffer[128];
 	// struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
 	void *out_msg;
 	size_t out_len;
@@ -623,7 +626,14 @@ static int peer_keepalive(int sockfd)
 	// out_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
 	// local_to_netmsg(nmsg, &out_msg, &out_len);
 
-    _keepalive_make(out_msg, 64, &out_len);
+    _keepalive_make(out_msg, 128, &out_len);
+
+    if ( out_len == 0 ) {
+#if DEBUG
+       fprintf(stderr, "client: make keepalive message failed.\n");
+#endif        
+       return -1;
+    }
 
 	if ( config.use_tcp ) {
         // uint32_t msg_len = htonl(out_len);

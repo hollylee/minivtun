@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/md5.h>
+#include <openssl/rand.h>
 #include <sys/types.h>
 #include <netdb.h>
 
@@ -51,14 +52,14 @@ const void *get_crypto_type(const char *name)
 		return NULL;
 	}
 }
-
+/*
 static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
 	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
 	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
 	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
 	0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
 };
-
+*/
 #define CRYPTO_DATA_PADDING(data, data_buffer_len, data_len, out_len, bs) \
 	do { \
         *out_len = data_len; \
@@ -73,20 +74,22 @@ static const char crypto_ivec_initdata[CRYPTO_MAX_BLOCK_SIZE] = {
 	} while(0)
 
 // return 0 if succeeded. -1 if failed
+//
+// Prepend 32 bytes IV before the encrypted data
 int datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
-		             void *out, size_t *out_len)
+		             void *out, size_t *out_len, void * iv)
 {
-	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
+	// size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
 	EVP_CIPHER_CTX * ctx;
-	unsigned char iv[CRYPTO_MAX_KEY_SIZE];
+	// unsigned char iv[CRYPTO_MAX_KEY_SIZE];
 	int outl = 0, outl2 = 0;
 
-	if (iv_len == 0)
-		iv_len = 16;
+	// if (iv_len == 0)
+	// 	iv_len = 16;
 
     *out_len = 0;
 
-	memcpy(iv, crypto_ivec_initdata, iv_len);
+	// memcpy(iv, crypto_ivec_initdata, iv_len);
 
 	ctx = EVP_CIPHER_CTX_new();
     if ( ctx == NULL )
@@ -110,20 +113,22 @@ int datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_bu
 }
 
 // Return 0 if succeeded, -1 if failed
+//
+// The load 32 bytes are IV. followed by encrypted data
 int datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len, 
-		void *out, size_t *out_len)
+		             void *out, size_t *out_len, void * iv)
 {
-	size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
+	// size_t iv_len = EVP_CIPHER_iv_length((const EVP_CIPHER *)cptype);
 	EVP_CIPHER_CTX * ctx;
-	unsigned char iv[CRYPTO_MAX_KEY_SIZE];
+	// unsigned char iv[CRYPTO_MAX_KEY_SIZE];
 	int outl = 0, outl2 = 0;
 
     *out_len = 0;
 
-	if (iv_len == 0)
-		iv_len = 16;
+	// if (iv_len == 0)
+	// 	iv_len = 16;
 
-	memcpy(iv, crypto_ivec_initdata, iv_len);
+	// memcpy(iv, crypto_ivec_initdata, iv_len);
 
 	ctx = EVP_CIPHER_CTX_new();
     if ( ctx == NULL ) 
@@ -146,6 +151,72 @@ int datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_bu
        *out_len = (size_t)(outl + outl2);
 
 	return succeeded ? 0 : -1;
+}
+
+// OpenSSL version compatibility
+// OpenSSL 1.1.1 or newer: use RAND_priv_bytes
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+  #define GET_RAND_BYTES(buf, len)   RAND_priv_bytes((buf), (len))
+#else
+  #define GET_RAND_BYTES(buf, len)   RAND_bytes((buf), (len))
+#endif    
+
+// Convert data to what would be sent out to the transport
+//
+// @param in. The input buffer
+// @param in_buffer_len. The whole input buffer langth, >= data len
+// @param in_data_len. The input data len <= in_buffer_len
+// @param out. The out buffer
+// @param out_buffer_len. The whole output buffer length. 
+// @param out_data_len. The data length in output buffer. <= out_buffer_len. This ths the output param.
+//
+// Update: a 32 bytes IV would be prepend to @param out. out must have enough buffer space.
+void local_to_netmsg(bool enabled_encryption, const char * crypto_key, const void * crypto_type, void *in, size_t in_buffer_len, size_t in_data_len, 
+                     void *out, size_t out_buffer_len, size_t *out_data_len)                            
+{
+    assert(out_buffer_len >= in_data_len + CRYPTO_MAX_KEY_SIZE);
+
+	if (enabled_encryption) {
+        
+        // Create a new random IV
+        unsigned char * iv = out;
+        GET_RAND_BYTES(iv, CRYPTO_MAX_KEY_SIZE);        
+        // encrypt it
+		if ( datagram_encrypt(crypto_key, crypto_type, in, in_buffer_len, in_data_len, (char *)out + CRYPTO_MAX_KEY_SIZE, 
+                              out_data_len, iv) < 0 ) {
+           *out_data_len = 0;
+        }
+        else {
+           *out_data_len += CRYPTO_MAX_KEY_SIZE;
+        }
+
+	} else {
+        memcpy(out + CRYPTO_MAX_KEY_SIZE, in, in_data_len);
+        *out_data_len = in_data_len + CRYPTO_MAX_KEY_SIZE;
+	}
+}
+
+// The @param in contains CRYPTO_MAX_KEY_SIZE IV first, then the encrypted data
+//
+// The returned @param out and the returned @param out_data_len didn't include the IV.
+void netmsg_to_local(bool enabled_encryption, const char * crypto_key, const void * crypto_type, 
+                     void *in, size_t in_buffer_len, size_t in_data_len, 
+                     void *out, size_t out_buffer_len, size_t *out_data_len)
+{
+    assert(out_buffer_len >= in_data_len - CRYPTO_MAX_KEY_SIZE);
+
+	if (enabled_encryption) {
+
+		if ( datagram_decrypt(crypto_key, crypto_type, in + CRYPTO_MAX_KEY_SIZE, in_buffer_len - CRYPTO_MAX_KEY_SIZE, 
+             in_data_len - CRYPTO_MAX_KEY_SIZE, out, out_data_len, in) < 0 ) {
+
+           *out_data_len = 0;
+        }
+
+	} else {
+        memcpy(out, in + CRYPTO_MAX_KEY_SIZE, in_data_len - CRYPTO_MAX_KEY_SIZE);
+        *out_data_len = in_data_len - CRYPTO_MAX_KEY_SIZE;
+	}
 }
 
 void fill_with_string_md5sum(const char *in, void *out, size_t outlen)

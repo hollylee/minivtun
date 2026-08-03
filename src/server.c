@@ -680,7 +680,7 @@ static void clear_tcp_write_list(struct ra_entry * entry)
  */
 static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 {
-	char in_data[64], crypt_buffer[64];
+	char in_data[128], crypt_buffer[128];
 	struct minivtun_msg *nmsg = (struct minivtun_msg *)in_data;
 	void *out_msg;
 	size_t out_len;
@@ -694,7 +694,11 @@ static int ra_entry_keepalive(struct ra_entry *re, int sockfd)
 
 	out_msg = crypt_buffer;
 	size_t keepalive_len = MINIVTUN_MSG_BASIC_HLEN + sizeof(nmsg->keepalive);
-	local_to_netmsg(nmsg, 64, keepalive_len, out_msg, 64, &out_len);
+	local_to_netmsg(enabled_encryption(), config.crypto_key, config.crypto_type, in_data, 128, keepalive_len, out_msg, 128, &out_len);
+
+    // Failed?
+    if ( out_len == 0 )
+       return -1;
 
     if ( re->is_tcp ) { // Exclude recycled 
 
@@ -1006,8 +1010,7 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
     // UDP
     else {
 	    real_peer_alen = sizeof(real_peer);
-	    rc = (int)recvfrom(sockfd, &read_buffer, NM_PI_BUFFER_SIZE, 0,
-		        	(struct sockaddr *)&real_peer, &real_peer_alen);
+	    rc = (int)recvfrom(sockfd, read_buffer, NM_PI_BUFFER_SIZE, 0, (struct sockaddr *)&real_peer, &real_peer_alen);
 	    if (rc <= 0)
 		    return 0;
     } // udp
@@ -1031,7 +1034,7 @@ static int network_receiving(int tunfd, int sockfd, struct ra_entry * re)
     // Decrypt payload. encrypted is in read_buffer, plain data is in nmsg, out_data(crypt_buffer) with length out_dlen
 	out_data = crypt_buffer;
 	// out_dlen = (size_t)rc;
-	netmsg_to_local(read_buffer, NM_PI_BUFFER_SIZE, rc, out_data, NM_PI_BUFFER_SIZE, &out_dlen);
+	netmsg_to_local(enabled_encryption(), config.crypto_key, config.crypto_type, read_buffer, NM_PI_BUFFER_SIZE, rc, out_data, NM_PI_BUFFER_SIZE, &out_dlen);
 	nmsg = out_data;
 
     // Check data length. If TCP, invalid data causes connection close.
@@ -1263,7 +1266,8 @@ static int tunnel_receiving(int tunfd, int sockfd)
 	/* Do encryption. */
 	out_data = crypt_buffer;
 	size_t in_data_len = MINIVTUN_MSG_IPDATA_OFFSET + ip_dlen;
-	local_to_netmsg(&nmsg, NM_PI_BUFFER_SIZE, in_data_len, out_data, NM_PI_BUFFER_SIZE, &out_dlen);
+	local_to_netmsg(enabled_encryption(), config.crypto_key, config.crypto_type, &nmsg, NM_PI_BUFFER_SIZE, 
+                    in_data_len, out_data, NM_PI_BUFFER_SIZE, &out_dlen);
 
 #if DEBUG
     dump_nmsg(&nmsg);

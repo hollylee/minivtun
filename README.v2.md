@@ -6,3 +6,8 @@ The server listens on tcp and udp simulteanously, in the same port specified in 
 
 The client specifies the transport type in command line. if '-T' is specified, the tcp transport is used. Otherwise the udp transport is used as before.
 
+## Using random IVs in each packet 
+
+Using random IVs in each packet creates different output for same contents. But it needs to embedded the IV into net_msg. 
+Therefore the net_msg structures are enlarged.
+

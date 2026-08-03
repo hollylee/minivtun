@@ -43,8 +43,9 @@ enum {
 	MINIVTUN_MSG_DISCONNECT,
 };
 
-#define NM_PI_BUFFER_SIZE  (1024 * 8)
+#define NM_PI_BUFFER_SIZE  ((1024 * 8) + CRYPTO_MAX_KEY_SIZE)
 
+// NOTE: A 32 bytes (potential) IV will be prepend to encrypted minivtun_msg on the wire.
 struct minivtun_msg {
 	struct {
 		__u8 opcode;
@@ -78,34 +79,15 @@ struct minivtun_msg {
 // @param out. The out buffer
 // @param out_buffer_len. The whole output buffer length. 
 // @param out_data_len. The data length in output buffer. <= out_buffer_len. This ths the output param.
-static inline void local_to_netmsg(void *in, size_t in_buffer_len, size_t in_data_len, 
-                                   void *out, size_t out_buffer_len, size_t *out_data_len)
-{
-	if (enabled_encryption()) {
-		if ( datagram_encrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_data_len) < 0 )
-           *out_data_len = 0;
-	} else {
-		// *out = in;
-        assert(out_buffer_len >= in_data_len);
-        memcpy(out, in, in_data_len);
-        *out_data_len = in_data_len;
-	}
-}
+//
+// The returned @param out and @param out_data_len contains the IV in the head.
+void local_to_netmsg(bool enabled_encryption, const char * crypto_key, const void * crypto_type, void *in, size_t in_buffer_len, size_t in_data_len, 
+                     void *out, size_t out_buffer_len, size_t *out_data_len);
 
-// NOTE: if no encryption, *out will be set to in
-static inline void netmsg_to_local(void *in, size_t in_buffer_len, size_t in_data_len, 
-                                   void *out, size_t out_buffer_len, size_t *out_data_len)
-{
-	if (enabled_encryption()) {
-		if ( datagram_decrypt(config.crypto_key, config.crypto_type, in, in_buffer_len, in_data_len, out, out_data_len) < 0 )
-           *out_data_len = 0;
-	} else {
-		// *out = in;
-        assert(out_buffer_len >= in_data_len);
-        memcpy(out, in, in_data_len);
-        *out_data_len = in_data_len;
-	}
-}
+// The input data @param in include pretended IV
+// The output @param out and @param out_data_len didn't include IV.
+void netmsg_to_local(bool enabled_encryption, const char * crypto_key, const void * crypto_type, void *in, size_t in_buffer_len, size_t in_data_len, 
+                     void *out, size_t out_buffer_len, size_t *out_data_len);
 
 int run_client(int tunfd, const char *peer_addr_pair);
 int run_server(int tunfd, const char *loc_addr_pair);

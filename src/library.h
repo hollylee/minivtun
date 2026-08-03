@@ -221,9 +221,9 @@ struct name_cipher_pair {
 extern struct name_cipher_pair cipher_pairs[];
 const void *get_crypto_type(const char *name);
 int datagram_encrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
-		void *out, size_t *dlen);
+		void *out, size_t *dlen, void * iv);
 int datagram_decrypt(const void *key, const void *cptype, void *in, size_t in_buffer_len, size_t in_data_len,
-		void *out, size_t *dlen);
+		void *out, size_t *dlen, void * iv);
 void fill_with_string_md5sum(const char *in, void *out, size_t outlen);
 
 /* =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= */
@@ -235,6 +235,7 @@ static inline int set_nonblock(int sockfd)
 	return 0;
 }
 
+#if DEBUG
 static inline void hexdump(void *d, size_t len)
 {
 	unsigned char *s;
@@ -242,6 +243,7 @@ static inline void hexdump(void *d, size_t len)
 		printf("%02x ", (unsigned int)*s);
 	printf("\n");
 }
+#endif
 
 void do_daemonize(void);
 
