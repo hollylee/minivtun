@@ -11,3 +11,7 @@ The client specifies the transport type in command line. if '-T' is specified, t
 Using random IVs in each packet creates different output for same contents. But it needs to embedded the IV into net_msg. 
 Therefore the net_msg structures are enlarged.
 
+## Remove old crypto support
+
+Removed 'des', 'desx', and 'rc4'.
+
