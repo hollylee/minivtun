@@ -24,10 +24,15 @@
 
 #if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
   #include "client_route.h"
-  #include "list.h"
 #endif
 
-static time_t last_recv = 0, last_keepalive = 0, current_ts = 0;
+#include "list.h"
+
+static time_t last_recv = 0, /*last_keepalive = 0,*/ current_ts = 0;
+
+#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPNSERVICE__)
+static time_t last_keepalive = 0;
+#endif
 
 // This would be called by both network_receiving() and NE codes 
 struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_buffer_len, size_t data_len, 
@@ -100,7 +105,7 @@ struct minivtun_msg * _network_data_handler(char * data_buffer, size_t data_buff
 }
 
 
-#if !defined(__APPLE_NETWORK_EXTENSION__) || !defined(__ANDROID_VPN_SERVICE__)
+#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
 
 // return read size in this call. < 0 if error (including EOF). *read_size returned total read size in this batch.
 static 
@@ -134,7 +139,7 @@ int read_tcp_data_nonblocking(int fd, char * buffer, size_t * read_size, size_t 
     }
 
     *read_size += read_bytes;
-    return read_bytes;
+    return (int)read_bytes;
 }
 
 // Write buffer queue for nonblocking writing
@@ -199,7 +204,7 @@ int write_tcp_data_nonblocking(int fd)
         free(entry);
     }
 
-    return written_size;
+    return (int)written_size;
 }
 
 // Queue a buffer for writing if ready.
@@ -239,7 +244,7 @@ int queue_writing_data(char * write_buffer, size_t write_len)
 
 // Clear whole writeing queue
 static
-void clear_writing_queue()
+void clear_writing_queue(void)
 {
     struct write_buffer_entry * entry, *temp;
 
@@ -329,7 +334,7 @@ static int network_receiving(int tunfd, int sockfd)
         fprintf(stderr, "Read net_msg len %zu from sockfd %d\n", tcp_msg_len, sockfd);
 #endif 
         memcpy(read_buffer, tcp_read_buffer, tcp_read_buffer_len);
-        rc = tcp_msg_len;
+        rc = (int)tcp_msg_len;
 
         // Reset
         tcp_read_buffer_len = 0;

@@ -142,7 +142,7 @@ void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, v
 
 void _keepalive_make(void * out_msg, size_t out_buffer_len, size_t * out_data_len);
 
-void set_config_params(const char * crypto_key);
+void set_config_params(const char * crypto_key, bool use_tcp);
 
 
 #endif /* __MINIVTUN_H */

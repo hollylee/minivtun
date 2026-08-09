@@ -476,12 +476,12 @@ int main(int argc, char *argv[])
 
 #if defined(__APPLE_NETWORK_EXTENSION__) || defined(__ANDROID_VPN_SERVICE__)
 
-void set_config_params(const char * crypto_key)
+void set_config_params(const char * crypto_key, bool use_tcp)
 {
-	 // strncpy(config.crypto_passwd, crypto_key, CRYPTO_MAX_KEY_SIZE);
      config.crypto_passwd = strdup(crypto_key);
 	 fill_with_string_md5sum(config.crypto_passwd, config.crypto_key, CRYPTO_MAX_KEY_SIZE);
-     config.crypto_type = get_crypto_type(CRYPTO_DEFAULT_ALGORITHM);	 
+     config.crypto_type = get_crypto_type(CRYPTO_DEFAULT_ALGORITHM);
+     config.use_tcp = use_tcp;
 }
 
 #endif // __APPLE_NETWORK_EXTENSION__
