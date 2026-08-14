@@ -624,6 +624,10 @@ int write_queued_tcp_data_nonblocking(int fd, struct ra_entry * entry)
     if ( written_size == 0 )
        return -1;
 
+#if DEBUG
+    fprintf(stderr, "Wrote queued tcp data %zd bytes to network\n", written_size);    
+#endif
+
     // Succeeded
     write_buffer->offset += written_size;
     assert(write_buffer->offset <= write_buffer->buffer_len);
