@@ -30,7 +30,7 @@
 
 static time_t last_recv = 0, /*last_keepalive = 0,*/ current_ts = 0;
 
-#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPNSERVICE__)
+#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
 static time_t last_keepalive = 0;
 #endif
 
@@ -457,7 +457,7 @@ void _tunnel_data_handler(void * data_buffer, size_t data_len, uint16_t proto, v
 }
 
 
-#ifndef __APPLE_NETWORK_EXTENSION__
+#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICE__)
 
 // Handling packets received from tunnel. That is, local applications send them to
 // outside.
@@ -609,7 +609,8 @@ void _keepalive_make(void * out_msg, size_t out_buffer_len, size_t * out_len)
                     out_msg, out_buffer_len, out_len);
 }
 
-#ifndef __APPLE_NETWORK_EXTENSION__
+
+#if !defined(__APPLE_NETWORK_EXTENSION__) && !defined(__ANDROID_VPN_SERVICES__)
 
 // Send keep-alive packet out
 static int peer_keepalive(int sockfd)
